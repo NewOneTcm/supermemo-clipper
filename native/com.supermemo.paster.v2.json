@@ -1,0 +1,9 @@
+﻿{
+    "name":  "com.supermemo.paster.v2",
+    "description":  "Activates SuperMemo, creates a new element (Alt+N) and pastes clipboard content (Ctrl+V).",
+    "path":  "D:\\develop\\supermemo-clipper-v2\\native\\host.bat",
+    "type":  "stdio",
+    "allowed_origins":  [
+                            "chrome-extension://phjnjcglcjnolkappnagdhmdjlhbcjlo/"
+                        ]
+}
