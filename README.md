@@ -18,26 +18,40 @@ v2 与 v1（`supermemo-clipper`）完全独立：独立的扩展目录、独立�
 3. 组装成 `<h1>标题</h1> + 来源链接 + <hr> + 正文` 的干净 HTML，同时生成纯文本版本，以 `text/html` + `text/plain` 两种格式写入剪贴板。
 4. 通过 native messaging 调起 `native\paste.ps1`：查进程 -> 激活 SuperMemo 窗口 -> Alt+N 新建条目 -> Ctrl+V 粘贴。
 
-## 安装
+## 配置方法（完整流程）
+
+### 1. 获取代码
+
+```powershell
+git clone https://github.com/NewOneTcm/supermemo-clipper.git
+cd supermemo-clipper
+```
+
+也可以直接点 GitHub 页面的 Code -> Download ZIP 解压。
+
+### 2. 加载扩展
 
 1. 打开 Chrome/Edge，地址栏输入 `chrome://extensions`
 2. 右上角打开「开发者模式」
-3. 点「加载已解压的扩展程序」，选择本文件夹 `supermemo-clipper-v2`
+3. 点「加载已解压的扩展程序」，选择刚克隆/解压的文件夹
 4. 把扩展固定到工具栏（拼图图标 -> 图钉）
 
-## 注册 native host（一次性，自动粘贴必需）
+### 3. 注册 native host（一次性，自动粘贴必需）
 
-1. 加载扩展后，在 `chrome://extensions` 页面复制扩展的 **ID**（一串字母）
-2. PowerShell 运行：
+1. 在 `chrome://extensions` 页面复制本扩展的 **ID**（一串字母）
+2. PowerShell 运行（路径换成你实际的克隆位置）：
    ```powershell
-   cd D:\develop\supermemo-clipper-v2\native
+   cd <仓库目录>\native
    .\install.ps1 -ExtensionId 你的扩展ID
    ```
+   脚本会自动做三件事：把扩展 ID 写入 `allowed_origins`、把 `path` 改成本机实际的 `host.bat` 绝对路径（克隆到任何目录都能用）、写入 Chrome 和 Edge 的注册表项。
 3. 重启浏览器。
+
+> 注意：之后如果**移动了仓库文件夹**，需要重跑一次 install.ps1，让注册表里的路径指向新位置。
 
 不注册也能用：popup 会提示「native host 未注册」，内容照常进剪贴板，手动切到 SuperMemo 粘贴即可。
 
-## 日常使用
+### 4. 日常使用
 
 - 打开文章页 -> 点扩展图标 -> 完事。SuperMemo 里已经出现一个排版干净的新条目。
 - SuperMemo 未运行时点击：内容在剪贴板里，打开 SuperMemo 后手动 Ctrl+V 即可，不会丢。

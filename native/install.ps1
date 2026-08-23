@@ -12,6 +12,9 @@ $manifestPath = Join-Path $here "com.supermemo.paster.v2.json"
 
 $manifest = Get-Content $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
 $manifest.allowed_origins = @("chrome-extension://$ExtensionId/")
+# Point the host at wherever this folder actually lives (works after cloning
+# the repo to any path, not just the original development machine).
+$manifest.path = (Join-Path $here "host.bat") -replace '/', '\'
 $manifest | ConvertTo-Json -Depth 5 | Set-Content $manifestPath -Encoding UTF8
 
 foreach ($root in @("HKCU:\Software\Google\Chrome\NativeMessagingHosts",
