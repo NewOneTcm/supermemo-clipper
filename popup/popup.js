@@ -23,6 +23,10 @@ function setStatus(text, cls) {
       setStatus("此页面类型不支持提取", "err");
       return;
     }
+    if (/\.pdf($|[?#])/i.test(tab.url || "")) {
+      setStatus("PDF 页面浏览器不允许注入脚本，暂不支持直接提取", "err");
+      return;
+    }
 
     const results = await chrome.scripting.executeScript({
       target: { tabId: tab.id },

@@ -13,6 +13,13 @@
     "ul", "ol", "li", "table", "thead", "tbody", "tr", "th", "td",
     "strong", "em", "b", "i", "u", "s", "sup", "sub", "br", "hr", "img", "a"
   ]);
+  // Disallowed but block-level tags (WeChat wraps every paragraph in
+  // <section>): convert to <p> instead of unwrapping, or paragraph breaks
+  // disappear and the article collapses into one blob of text.
+  var BLOCK_FALLBACK = new Set([
+    "section", "div", "article", "main", "aside", "header", "footer",
+    "figure", "figcaption", "nav", "center", "details", "summary", "caption"
+  ]);
   var GLOBAL_ATTRS = new Set([]);
   var TAG_ATTRS = {
     a: new Set(["href"]),
@@ -24,13 +31,19 @@
   function sanitize(html) {
     var doc = new DOMParser().parseFromString(html, "text/html");
     var walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_ELEMENT);
-    var toRemove = [];
+    var toRemove = [], toConvert = [];
     var node;
     while ((node = walker.nextNode())) {
       var tag = node.tagName.toLowerCase();
       if (!ALLOWED_TAGS.has(tag)) {
-        toRemove.push(node);
+        if (BLOCK_FALLBACK.has(tag)) toConvert.push(node);
+        else toRemove.push(node);
         continue;
+      }
+      // Lazy-loaded images (e.g. WeChat) carry the real URL in data-src.
+      if (tag === "img" && !node.getAttribute("src")) {
+        var dataSrc = node.getAttribute("data-src");
+        if (dataSrc && /^https?:/i.test(dataSrc)) node.setAttribute("src", dataSrc);
       }
       // Strip every attribute except the whitelisted ones.
       var allowed = TAG_ATTRS[tag] || GLOBAL_ATTRS;
@@ -47,7 +60,15 @@
         if (/^\s*(javascript|data):/i.test(src)) toRemove.push(node);
       }
     }
-    // Unwrap disallowed tags but keep their inner text/HTML.
+    // Rewrite block-level tags to <p>, then unwrap inline disallowed tags
+    // while keeping their inner text/HTML.
+    toConvert.forEach(function (el) {
+      var parent = el.parentNode;
+      if (!parent) return;
+      var p = doc.createElement("p");
+      while (el.firstChild) p.appendChild(el.firstChild);
+      parent.replaceChild(p, el);
+    });
     toRemove.forEach(function (el) {
       var parent = el.parentNode;
       if (!parent) return;
