@@ -45,6 +45,22 @@
         var dataSrc = node.getAttribute("data-src");
         if (dataSrc && /^https?:/i.test(dataSrc)) node.setAttribute("src", dataSrc);
       }
+      // WeChat CDN: with tp=webp the server returns WebP, which SuperMemo's
+      // IE-based HTML renderer cannot display. Strip the format-override and
+      // lazy-load params so a plain JPEG/PNG is served instead.
+      if (tag === "img") {
+        var imgSrc = node.getAttribute("src") || "";
+        if (/^https?:\/\/mmbiz\.(qpic|qlogo)\.cn\//i.test(imgSrc)) {
+          try {
+            var u = new URL(imgSrc);
+            u.searchParams.delete("tp");
+            u.searchParams.delete("wxfrom");
+            u.searchParams.delete("wx_lazy");
+            u.hash = "";
+            node.setAttribute("src", u.toString());
+          } catch (_) { /* keep original src on parse failure */ }
+        }
+      }
       // Strip every attribute except the whitelisted ones.
       var allowed = TAG_ATTRS[tag] || GLOBAL_ATTRS;
       for (var i = node.attributes.length - 1; i >= 0; i--) {
