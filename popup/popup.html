@@ -3,15 +3,33 @@
 <head>
   <meta charset="utf-8">
   <style>
-    body { font: 13px/1.4 "Segoe UI", sans-serif; margin: 0; padding: 10px 14px; min-width: 220px; max-width: 320px; }
+    body { font: 13px/1.4 "Segoe UI", sans-serif; margin: 0; padding: 10px 14px; min-width: 250px; max-width: 320px; }
     #status { color: #333; }
     #status.ok { color: #1e8e4d; }
     #status.warn { color: #b9770e; }
     #status.err { color: #c0392b; }
+    #modes { display: flex; gap: 14px; margin-bottom: 6px; }
+    #modes label { display: flex; align-items: center; gap: 4px; cursor: pointer; }
+    #modes input { margin: 0; cursor: pointer; }
+    #hint { color: #777; font-size: 11px; line-height: 1.35; margin-bottom: 10px; }
+    #run {
+      display: block; width: 100%; margin: 0 0 8px; padding: 6px 8px;
+      font: inherit; font-weight: 500; cursor: pointer;
+      border: 1px solid #1a73e8; border-radius: 4px;
+      background: #1a73e8; color: #fff;
+    }
+    #run:hover { background: #1667cf; }
+    #run:disabled { opacity: .55; cursor: default; }
   </style>
 </head>
 <body>
-  <div id="status">正在提取…</div>
+  <div id="modes">
+    <label><input type="radio" name="mode" value="article" checked> 正文模式</label>
+    <label><input type="radio" name="mode" value="full"> 全页模式</label>
+  </div>
+  <div id="hint">正文模式自动识别主文章；全页模式导出整个页面，适合 ChatGPT 这类多轮对话。选择会按站点记下来。</div>
+  <button id="run">提取并粘贴到 SuperMemo</button>
+  <div id="status">选好模式后点上面的按钮开始提取。</div>
   <script src="popup.js"></script>
 </body>
 </html>

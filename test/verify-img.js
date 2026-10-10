@@ -1,21 +1,17 @@
-// One-off check: run extract.js on the saved WeChat page and list final img
-// srcs to confirm the tp=webp (WebP) params are gone.
+// One-off check: run article mode on a saved WeChat page and list the final
+// img srcs to confirm the tp=webp (WebP) params are gone.
+//   node test/verify-img.js <saved-page.html>
 "use strict";
+
 const fs = require("fs");
-const path = require("path");
-const { JSDOM } = require("jsdom");
+const { extract } = require("./harness");
 
-const dom = new JSDOM(fs.readFileSync(process.argv[2], "utf8"), {
-  url: "https://mp.weixin.qq.com/s/test",
-  runScripts: "outside-only"
-});
-const w = dom.window;
-const jc = w.document.getElementById("js_content");
-if (jc) jc.style.visibility = "visible";
+const r = extract(
+  fs.readFileSync(process.argv[2], "utf8"),
+  "https://mp.weixin.qq.com/s/test",
+  "article"
+);
 
-w.eval(fs.readFileSync(path.join(__dirname, "../lib/Readability.js"), "utf8"));
-const src = fs.readFileSync(path.join(__dirname, "../content/extract.js"), "utf8");
-const r = w.eval("var __r = " + src.replace(/;\s*$/, "") + "; __r");
 console.log("ok:", r.ok);
 const imgs = [];
 const re = /<img[^>]*src="([^"]+)"/g;

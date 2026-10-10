@@ -1,6 +1,7 @@
 # Native messaging host: reads one length-prefixed JSON message from stdin,
-# activates the SuperMemo window, creates a new element (Alt+N) and pastes
-# (Ctrl+V), then replies on stdout.
+# activates the SuperMemo window, tells SuperMemo to add a new article
+# (Ctrl+N — it creates the element AND pastes the clipboard itself), then
+# replies on stdout.
 param()
 
 $ErrorActionPreference = "Stop"
@@ -41,6 +42,20 @@ public class FG {
 "@
 
 try {
+    # 0) Clipboard guard. SuperMemo's article paste reads the clipboard itself
+    #    and reports "Error adding new text topic. Cannot open clipboard" when
+    #    it is locked or empty — an error we can neither explain nor retry from
+    #    here. Probe it first so the popup can say something actionable.
+    #    If the probe itself fails (STA / module availability), don't block:
+    #    proceed exactly as before.
+    try {
+        $clipText = [string](Get-Clipboard -Raw -ErrorAction Stop)
+        if (-not $clipText.Trim()) {
+            Write-Message @{ ok = $false; code = "clipboard_empty"; error = "clipboard has no text" }
+            exit 0
+        }
+    } catch { }
+
     # 1) Process check first: title matching alone can't tell "not running"
     #    apart from "running but window not found".
     $proc = Get-Process | Where-Object { $_.MainWindowHandle -ne 0 -and $_.ProcessName -like "sm*" } |
@@ -71,11 +86,20 @@ try {
         exit 0
     }
 
-    # 3) New element, wait for it to take focus, then paste.
-    Start-Sleep -Milliseconds 250
-    $shell.SendKeys("%n")   # Alt+N: new element/page in SuperMemo
-    Start-Sleep -Milliseconds 400
-    $shell.SendKeys("^v")   # Ctrl+V: paste clipboard content
+    # 3) Add a new article, in ONE step. Ctrl+N is SuperMemo's
+    #    "Edit : Add to category : Article" — SuperMemo creates the element and
+    #    pastes the clipboard into it by itself. That is exactly what a human
+    #    does when clipping a page, and it is why this host no longer sends
+    #    Alt+N + Ctrl+V:
+    #      * Alt+N is "Add to category : Note" — it creates a BLANK note and
+    #        ignores the clipboard, so it needed the extra Ctrl+V to be useful.
+    #      * That Ctrl+V then raced the element editor for focus. If it lost,
+    #        it landed on the Contents window, where Ctrl+V means
+    #        "Paste element" — which only accepts data SuperMemo's own
+    #        Copy element put on the clipboard, so foreign HTML raised an error.
+    #    One SendKeys also halves the timing gamble.
+    Start-Sleep -Milliseconds 300
+    $shell.SendKeys("^n")   # Ctrl+N: new article, pasted from the clipboard
 
     Write-Message @{ ok = $true }
 } catch {
