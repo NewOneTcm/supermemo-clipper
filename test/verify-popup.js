@@ -34,6 +34,7 @@ async function boot(opts) {
   const { window } = dom;
   const calls = [];
   const funcCalls = [];
+  const nativeMsgs = [];
   const store = { siteModes: opts.siteModes };
 
   window.close = () => {};
@@ -52,8 +53,14 @@ async function boot(opts) {
       }
     },
     runtime: {
-      sendNativeMessage: async () =>
-        (opts.native === undefined ? { ok: true } : opts.native)
+      sendNativeMessage: async (_host, msg) => {
+        nativeMsgs.push(msg);
+        if (msg && msg.action === "diagnose") {
+          return opts.diagnose === undefined ? { ok: true, code: "diagnose" } : opts.diagnose;
+        }
+        return opts.native === undefined ? { ok: true } : opts.native;
+      },
+      getManifest: () => ({ version: "9.9.9-test" })
     },
     storage: {
       local: {
@@ -70,9 +77,14 @@ async function boot(opts) {
     dom,
     calls,
     funcCalls,
+    nativeMsgs,
     store,
     status: () => window.document.getElementById("status").textContent,
+    ver: () => window.document.getElementById("ver").textContent,
     label: () => window.document.getElementById("run").textContent,
+    diagText: () => window.document.getElementById("diag").textContent,
+    diagVisible: () =>
+      window.document.getElementById("diag").style.display !== "none",
     pick: async (value) => {
       const input = window.document.querySelector('input[value="' + value + '"]');
       input.checked = true;
@@ -81,6 +93,10 @@ async function boot(opts) {
     },
     run: async () => {
       window.document.getElementById("run").click();
+      await tick(120);
+    },
+    diagnose: async () => {
+      window.document.getElementById("diagBtn").click();
       await tick(120);
     }
   };
@@ -98,6 +114,9 @@ async function boot(opts) {
       r.label() === "提取正文并粘贴到 SuperMemo", r.label());
     check("状态是等待操作，不是「正在提取」",
       !/正在提取/.test(r.status()), r.status());
+    // Version badge: the quickest way to tell whether Chrome is running the
+    // files on disk or a stale copy from before "重新加载".
+    check("popup 显示扩展版本号", /v9\.9\.9-test/.test(r.ver()), r.ver());
 
     await r.run();
     check("点按钮后才注入", r.calls.length === 1, JSON.stringify(r.calls));
@@ -194,11 +213,16 @@ async function boot(opts) {
   {
     // The clipboard guard added in v2.2.1 exists so SuperMemo's own failure
     // ("Error adding new text topic. Cannot open clipboard") never has to be
-    // the first thing the user sees.
+    // the first thing the user sees. The activate_failed branch gained teeth in
+    // v2.2.4: it now names the window that actually held the foreground, which
+    // is the difference between "SuperMemo refused" and "Chrome kept it".
     const cases = [
       ["成功", { ok: true }, /已新建条目并粘贴到 SuperMemo/],
+      ["成功（带收件窗口）", { ok: true, fg: "MYBRAIN (SuperMemo 20: d:\\supermemo\\systems\\)" },
+        /收件窗口：MYBRAIN/],
       ["未运行", { ok: false, code: "not_running" }, /打开后按 Ctrl\+N 即可/],
-      ["无法激活", { ok: false, code: "activate_failed" }, /手动按 Ctrl\+N/],
+      ["无法激活", { ok: false, code: "activate_failed", fg: "ChatGPT - Google Chrome" },
+        /没能把 SuperMemo 切到前台（当前前台是「ChatGPT - Goog/],
       ["剪贴板为空", { ok: false, code: "clipboard_empty" }, /剪贴板里没有内容/],
       ["host 未注册", null, /native host 未注册/]
     ];
@@ -211,6 +235,192 @@ async function boot(opts) {
       await r.run();
       check(name + " -> " + want.source, want.test(r.status()), r.status());
     }
+
+    const fail = await boot({
+      url: "https://mp.weixin.qq.com/s/x",
+      results: { "content/extract.js": OK },
+      native: { ok: false, code: "activate_failed", fg: "ChatGPT - Google Chrome" }
+    });
+    await fail.run();
+    check("激活失败时把诊断面板亮出来",
+      fail.diagVisible(), fail.diagText());
+  }
+
+  console.log("\n[ popup / 诊断按钮 ]");
+  {
+    const diagPayload = {
+      ok: true,
+      code: "diagnose",
+      clipboardFormats: ["HTML Format", "UnicodeText"],
+      clipboardTextLen: 3657,
+      clipboardHasHtml: true,
+      clipboardProbeError: null,
+      smProcess: "sm20",
+      smPid: 12724,
+      windowCount: 9,
+      windows: ["MYBRAIN (SuperMemo 20: d:\\supermemo\\systems\\)"],
+      foregroundTaken: true,
+      foregroundTitle: "反共识观点：第6辑 处世. 观点1.  反对盲目跟风投资",
+      attempts: 1,
+      previousRun: {
+        ts: "2026-10-11 16:20:01",
+        result: "sent",
+        foreground_attempts: 3,
+        foreground_title: "ChatGPT - Google Chrome",
+        foreground_after: "MYBRAIN (SuperMemo 20: d:\\supermemo\\systems\\)",
+        sm_windows_before: 8,
+        sm_windows_after: 9,
+        clipboard_text_len: 3657,
+        clipboard_has_html: true
+      },
+      log: "C:\\Users\\Newone\\AppData\\Local\\Temp\\supermemo-clipper-last.json"
+    };
+    const r = await boot({
+      url: "https://mp.weixin.qq.com/s/x",
+      results: { "content/extract.js": OK },
+      diagnose: diagPayload
+    });
+    await r.diagnose();
+    check("诊断请求带 action=diagnose",
+      r.nativeMsgs.length === 1 && r.nativeMsgs[0].action === "diagnose",
+      JSON.stringify(r.nativeMsgs));
+    check("诊断不注入脚本、不提取", r.calls.length === 0, JSON.stringify(r.calls));
+    check("诊断不新建条目（状态里明说）",
+      /没有新建条目/.test(r.status()), r.status());
+
+    const t = r.diagText();
+    check("显示剪贴板字数与格式", /3657 字 \+ HTML/.test(t) && /HTML Format/.test(t), t);
+    check("显示 SuperMemo 进程与窗口数",
+      /sm20 \(pid 12724\)/.test(t) && /可见顶层窗口 9 个/.test(t), t);
+    check("显示能不能接管前台", /能否从 Chrome 手里接管前台：可以（第 1 次尝试成功）/.test(t), t);
+    check("回显上次运行的真实收件窗口",
+      /发键时前台：ChatGPT - Google Chrome/.test(t), t);
+    check("回显发键后的前台窗口",
+      /发键后前台：MYBRAIN/.test(t), t);
+    check("回显 SuperMemo 窗口数变化", /SuperMemo 窗口数：8 → 9/.test(t), t);
+    check("给出日志文件路径", /supermemo-clipper-last\.json/.test(t), t);
+
+    // The case that motivates the button: the host cannot take the foreground.
+    const bad = await boot({
+      url: "https://mp.weixin.qq.com/s/x",
+      results: { "content/extract.js": OK },
+      diagnose: {
+        ok: true, code: "diagnose", clipboardTextLen: 0, clipboardHasHtml: false,
+        smProcess: "sm20", smPid: 1, windowCount: 2,
+        foregroundTaken: false, foregroundTitle: "ChatGPT - Google Chrome",
+        attempts: 27, previousRun: null, log: "C:\\Temp\\x.json"
+      }
+    });
+    await bad.diagnose();
+    check("抢不到前台时明确指出来",
+      /不可以 ← 这就是粘贴失败的原因/.test(bad.diagText()), bad.diagText());
+    check("没有上次记录时也说得清楚",
+      /还没有记录/.test(bad.diagText()), bad.diagText());
+
+    // host not registered at all
+    const none = await boot({
+      url: "https://mp.weixin.qq.com/s/x",
+      results: { "content/extract.js": OK },
+      diagnose: null
+    });
+    await none.diagnose();
+    check("host 无响应时给安装指引",
+      /install\.ps1/.test(none.diagText()), none.diagText());
+    check("host 无响应时状态是失败",
+      /诊断失败/.test(none.status()), none.status());
+  }
+
+  console.log("\n[ popup / 状态栏回显抓取量与 URL 统计 ]");
+  {
+    const r = await boot({
+      url: "https://example.com/book/",
+      results: {
+        "content/extract-full.js": {
+          ok: true, html: "<p>x</p>", text: "x",
+          meta: {
+            scope: "page", blocks: 0, chars: 1234,
+            urls: { img: 2, imgDropped: 0, link: 23, linkDropped: 1 }
+          }
+        }
+      }
+    });
+    await r.pick("full");
+    await r.run();
+    const s = r.status();
+    check("回显字数", /1234 字/.test(s), s);
+    check("回显图片与链接数", /图 2 · 链 23/.test(s), s);
+    check("有丢弃时回显丢弃数", /丢弃 1 个无效链接/.test(s), s);
+  }
+
+  console.log("\n[ popup / 剪贴板来源地址：页面 URL 必须随消息发给宿主 ]");
+  {
+    // SuperMemo pastes into an IE component whose base URL comes from the
+    // clipboard's CF_HTML SourceURL. Chrome stamps that with the POPUP's
+    // chrome-extension URL, which IE cannot use, so it falls back to its
+    // internal res:// base and Windows pops the "open this 'res' link?"
+    // dialog. Only the popup knows which page the note came from, so the page
+    // URL must travel with every native call.
+    const r = await boot({
+      url: "https://chatgpt.com/c/68f0a1b2-test",
+      results: { "content/extract-full.js": OK }
+    });
+    await r.pick("full");
+    await r.run();
+    const pasteMsg = r.nativeMsgs.find((m) => m.action === "new_and_paste");
+    check("提取时发的是 new_and_paste", !!pasteMsg, JSON.stringify(r.nativeMsgs));
+    check("消息里带 pageUrl（当前页地址）",
+      pasteMsg && pasteMsg.pageUrl === "https://chatgpt.com/c/68f0a1b2-test",
+      pasteMsg && pasteMsg.pageUrl);
+    check("消息里带扩展版本号（宿主日志可查是哪一版干的）",
+      pasteMsg && pasteMsg.version === "9.9.9-test", pasteMsg && pasteMsg.version);
+  }
+
+  console.log("\n[ popup / 来源地址修正的回显 ]");
+  {
+    const fixed = await boot({
+      url: "https://chatgpt.com/c/x",
+      results: { "content/extract-full.js": OK },
+      native: { ok: true, fg: "SuperMemo - 集合", sourceStatus: "fixed" }
+    });
+    await fixed.pick("full");
+    await fixed.run();
+    check("修好时状态里明确写出来（这次修复的可见部分）",
+      /来源地址已修正/.test(fixed.status()), fixed.status());
+
+    const notFixed = await boot({
+      url: "https://chatgpt.com/c/x",
+      results: { "content/extract-full.js": OK },
+      native: { ok: true, fg: "SuperMemo" }
+    });
+    await notFixed.pick("full");
+    await notFixed.run();
+    check("没改（例如没装宿主）时不谎报已修正",
+      !/来源地址已修正/.test(notFixed.status()), notFixed.status());
+  }
+
+  console.log("\n[ popup / 诊断里要看得到剪贴板来源地址 ]");
+  {
+    const r = await boot({
+      url: "https://chatgpt.com/c/x",
+      results: { "content/extract-full.js": OK },
+      diagnose: {
+        ok: true, code: "diagnose",
+        clipboardTextLen: 10, clipboardHasHtml: true,
+        clipboardFormats: ["HTML Format", "UnicodeText"],
+        clipSourceUrl: "chrome-extension://abc/popup/popup.html",
+        clipSourceWouldBe: "https://chatgpt.com/c/x",
+        clipSourceStatus: "would-fix",
+        smProcess: "sm20", smPid: 1, windowCount: 2,
+        foregroundTaken: true, attempts: 1, log: "C:\\Temp\\x.json"
+      }
+    });
+    await r.diagnose();
+    const d = r.diagText();
+    check("诊断里显示当前 SourceURL", /chrome-extension:\/\/abc\/popup\/popup\.html/.test(d), d);
+    check("诊断里说明会被改写成网页地址", /会被改写成上面的网页地址/.test(d), d);
+    const diagMsg = r.nativeMsgs.find((m) => m.action === "diagnose");
+    check("诊断消息也带 pageUrl", diagMsg && diagMsg.pageUrl === "https://chatgpt.com/c/x",
+      JSON.stringify(diagMsg));
   }
 
   console.log("\n[ popup / loadChatHistory 注入函数 ]");

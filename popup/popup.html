@@ -20,6 +20,18 @@
     }
     #run:hover { background: #1667cf; }
     #run:disabled { opacity: .55; cursor: default; }
+    #foot { display: flex; align-items: center; justify-content: space-between; margin-top: 8px; }
+    #diagBtn {
+      font: inherit; font-size: 11px; padding: 1px 6px; cursor: pointer;
+      border: 1px solid #bbb; border-radius: 3px; background: #fafafa; color: #444;
+    }
+    #diagBtn:hover { background: #f0f0f0; }
+    #diagBtn:disabled { opacity: .55; cursor: default; }
+    #ver { color: #999; font-size: 10px; }
+    #diag { display: none; margin-top: 8px; padding: 6px 8px; background: #f6f8fa;
+            border: 1px solid #e1e4e8; border-radius: 4px;
+            font: 11px/1.4 Consolas, monospace; color: #333;
+            white-space: pre-wrap; word-break: break-all; }
   </style>
 </head>
 <body>
@@ -30,6 +42,11 @@
   <div id="hint">正文模式自动识别主文章；全页模式导出整个页面，适合 ChatGPT 这类多轮对话。选择会按站点记下来。</div>
   <button id="run">提取并粘贴到 SuperMemo</button>
   <div id="status">选好模式后点上面的按钮开始提取。</div>
+  <div id="diag"></div>
+  <div id="foot">
+    <button id="diagBtn" title="只检查剪贴板 / SuperMemo 进程 / 能否接管前台，不发按键、不新建条目">诊断</button>
+    <span id="ver"></span>
+  </div>
   <script src="popup.js"></script>
 </body>
 </html>

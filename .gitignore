@@ -1,0 +1,9 @@
+# Scratch output of the dev tools (test/inspect-live.js saves the rendered DOM
+# and the extracted payloads here; test/verify-wechat.js takes a saved page too).
+# Regenerated on demand — never worth committing.
+test/saved/
+
+# One-off logs written while debugging a specific machine (clipboard dumps,
+# host stderr, parse checks). Never part of the extension.
+test/_*.log
+native/_*.txt

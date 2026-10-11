@@ -15,7 +15,12 @@ $manifest.allowed_origins = @("chrome-extension://$ExtensionId/")
 # Point the host at wherever this folder actually lives (works after cloning
 # the repo to any path, not just the original development machine).
 $manifest.path = (Join-Path $here "host.bat") -replace '/', '\'
-$manifest | ConvertTo-Json -Depth 5 | Set-Content $manifestPath -Encoding UTF8
+# Write it back WITHOUT a BOM. Windows PowerShell 5.1's `Set-Content -Encoding
+# UTF8` prepends one, and a BOM in a native-messaging manifest is a needless
+# risk: Chrome parses that file as plain JSON.
+$json = $manifest | ConvertTo-Json -Depth 5
+[System.IO.File]::WriteAllText(
+    $manifestPath, $json, (New-Object System.Text.UTF8Encoding($false)))
 
 foreach ($root in @("HKCU:\Software\Google\Chrome\NativeMessagingHosts",
                      "HKCU:\Software\Microsoft\Edge\NativeMessagingHosts")) {

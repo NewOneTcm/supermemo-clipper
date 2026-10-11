@@ -93,19 +93,37 @@
   }
 
   // Returns "" when the URL cannot be safely handed to SuperMemo.
+  //
+  // Every URL that survives is ABSOLUTE. There is deliberately no "keep it
+  // relative" branch — not even for same-page "#anchor" links.
+  //
+  // Why, in one line: SuperMemo renders the note in an IE (mshtml) component,
+  // and IE resolves a relative URL against the *document's* base URL. A note
+  // pasted from the clipboard has no base URL of its own — unlike SuperMemo's
+  // own Web Import, which saves the source URL as one — so a relative URL gets
+  // resolved against IE's internal loading context, i.e. it comes out as a
+  // `res://…` URL. Modern IE no longer serves `res://` (Microsoft crippled the
+  // res protocol for security after the res://-zone UXSS bugs), so it hands
+  // the URL to ShellExecute instead — and Windows pops
+  // "How do you want to open this 'res' link?".
+  //
+  // Practical consequence: leaving ONE relative `src`/`href` in the note is
+  // enough to pop that dialog, which is why this function has no exceptions.
+  // `#anchor` targets are absolutised too — the note carries no matching id
+  // anyway, so pointing them at the live page is strictly more useful.
   function resolveUrl(raw, baseUrl, kind) {
     var s = (raw || "").trim();
     if (!s) return "";
-    if (kind === "link" && s.charAt(0) === "#") return s; // in-page anchor
 
     if (/^[a-z][a-z0-9+.-]*:/i.test(s)) {
       // Has an explicit scheme (res://, javascript:, blob:, ms-...): keep only
       // the ones we vetted.
       return isAllowedUrl(s, kind) ? s : "";
     }
+    // No scheme at all: /x, ./x, ../x, x, //host/x and #anchor all land here
+    // and get resolved against the page URL.
     if (!baseUrl) return "";
     try {
-      // Handles //host/x, /x and x alike.
       var abs = new URL(s, baseUrl).href;
       return isAllowedUrl(abs, kind) ? abs : "";
     } catch (_) {
@@ -117,15 +135,37 @@
     opts = opts || {};
     var dropChrome = !!opts.dropChrome;
     var baseUrl = opts.baseUrl || "";
+    // Optional tally of what happened to URLs. The popup surfaces it so a
+    // "the note misbehaved" report can be narrowed down without guessing:
+    // a non-zero *Dropped count means content was thrown away here.
+    var stats = opts.stats || null;
+    function bump(key) { if (stats) stats[key] = (stats[key] || 0) + 1; }
+
     var doc = new DOMParser().parseFromString(html, "text/html");
     var walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_ELEMENT);
     var toRemove = [], toConvert = [], toDrop = [];
+    // Subtrees already condemned to removal. The TreeWalker still descends into
+    // them, so every pass below has to ignore those nodes explicitly —
+    // otherwise the URL tallies count images and links that are removed a
+    // moment later along with their ancestor, and the popup reports numbers
+    // that do not match the note.
+    var doomed = new Set();
+
+    function inDoomed(el) {
+      for (var p = el.parentNode; p; p = p.parentNode) {
+        if (doomed.has(p)) return true;
+      }
+      return false;
+    }
+
     var node;
 
     while ((node = walker.nextNode())) {
+      if (inDoomed(node)) continue;
       var tag = node.tagName.toLowerCase();
 
       if (DROP_TAGS.has(tag)) {
+        doomed.add(node);
         toDrop.push(node);
         continue;
       }
@@ -134,6 +174,7 @@
         if (CHROME_TAGS.has(tag) ||
             CHROME_ROLES.has(role) ||
             node.getAttribute("aria-hidden") === "true") {
+          doomed.add(node);
           toDrop.push(node);
           continue;
         }
@@ -156,9 +197,11 @@
         if (!src) {
           // No usable source: an <img> with nothing to show is just a broken
           // box (or, with a scheme like res://, a Windows error dialog).
+          bump("imgDropped");
           toDrop.push(node);
           continue;
         }
+        bump("img");
         node.setAttribute("src", src);
         // WeChat CDN: with tp=webp the server returns WebP, which SuperMemo's
         // IE-based HTML renderer cannot display. Strip the format-override and
@@ -184,8 +227,13 @@
       }
       if (tag === "a") {
         var href = resolveUrl(node.getAttribute("href") || "", baseUrl, "link");
-        if (href) node.setAttribute("href", href);
-        else node.removeAttribute("href");
+        if (href) {
+          node.setAttribute("href", href);
+          bump("link");
+        } else {
+          node.removeAttribute("href");
+          bump("linkDropped");
+        }
       }
     }
 
@@ -207,6 +255,23 @@
 
     // Finally unwrap leftover inline disallowed tags, keeping their content.
     toRemove.forEach(unwrap);
+
+    // IE-only markup that a standards parser cannot see.
+    //
+    // A "downlevel-hidden" conditional comment — <!--[if IE]> <img src="/x.png">
+    // <![endif]--> — is a COMMENT to Chrome (and to every DOM API, so no
+    // DOM-based cleaner can ever inspect it), but real MARKUP to Internet
+    // Explorer, which is the engine SuperMemo renders notes in. A relative URL
+    // hidden inside one is therefore invisible to sanitize() and still resolves
+    // to res:// inside SuperMemo. Comments are worthless in a clipping, so all
+    // of them go — this closes the one hole the DOM cannot see.
+    var comments = doc.createNodeIterator(doc.body, NodeFilter.SHOW_COMMENT, null);
+    var doomedComments = [];
+    var comment;
+    while ((comment = comments.nextNode())) doomedComments.push(comment);
+    doomedComments.forEach(function (n) {
+      if (n.parentNode) n.parentNode.removeChild(n);
+    });
 
     pruneEmpty(doc);
     return doc.body.innerHTML;
@@ -289,7 +354,34 @@
     });
   }
 
-  function build(bodyHtml, title, url) {
+  // Last-resort net over the FINISHED note.
+  //
+  // sanitize() already guarantees this (every href/src that survives it is
+  // absolute and scheme-checked), and test/url-forensics.js proves it by
+  // parsing the output and auditing every attribute. This pass exists so the
+  // guarantee cannot be lost by a future edit anywhere else in the pipeline:
+  // whatever we are about to put on the clipboard is checked once more, as a
+  // string, and any href/src that is not absolute+safe is deleted.
+  //
+  // Deleting the attribute (rather than the element) is deliberate: an <img>
+  // without src is a broken box, but it is not a URL, and an <a> without href
+  // is plain text. Nothing here may ever *create* a URL.
+  //
+  // Not even a "#anchor" is exempt — IE resolves it against the base URL the
+  // note does not have, and the Windows dialog followed exactly that case.
+  var NOTE_URL_RE = /(\s(?:href|src)\s*=\s*")([^"]*)(")/gi;
+
+  function scrubNoteUrls(html, stats) {
+    return html.replace(NOTE_URL_RE, function (all, pre, value, post) {
+      var kind = /href/i.test(pre) ? "link" : "img";
+      var v = (value || "").trim();
+      if (v && isAllowedUrl(v, kind)) return all;
+      if (stats) stats.scrubbed = (stats.scrubbed || 0) + 1;
+      return "";
+    });
+  }
+
+  function build(bodyHtml, title, url, stats) {
     title = title || "";
     url = url || "";
     var html =
@@ -316,13 +408,20 @@
       "#Source: Web import\n" +
       "#Link: " + url;
 
-    return { ok: true, title: title, url: url, html: html, text: text };
+    return {
+      ok: true,
+      title: title,
+      url: url,
+      html: scrubNoteUrls(html, stats),
+      text: text
+    };
   }
 
   window.__smClip = {
     sanitize: sanitize,
     pruneEmpty: pruneEmpty,
     htmlToText: htmlToText,
+    scrubNoteUrls: scrubNoteUrls,
     build: build
   };
 })();

@@ -55,15 +55,20 @@
       holder = document.body.cloneNode(true);
     }
 
+    var stats = { img: 0, imgDropped: 0, link: 0, linkDropped: 0 };
     var bodyHtml = api.sanitize(holder.innerHTML, {
       dropChrome: true,
-      baseUrl: url
+      baseUrl: url,
+      stats: stats
     });
-    var out = api.build(bodyHtml, title, url);
+    // Same stats object into build(): its last-resort URL net records anything
+    // it had to delete as stats.scrubbed (expected to stay 0).
+    var out = api.build(bodyHtml, title, url, stats);
     out.meta = {
       scope: blocks ? "chat" : "page",
       blocks: blocks ? blocks.length : 0,
-      chars: out.text.length
+      chars: out.text.length,
+      urls: stats
     };
     return out;
   } catch (e) {

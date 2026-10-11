@@ -10,19 +10,35 @@
 //             WeChat). Fails or truncates on multi-message pages.
 //   full    — whole <body>, or just the message blocks on a chat page.
 //
-// After copying, the native host activates SuperMemo and sends Ctrl+N, which
-// is SuperMemo's "Add a new article": it creates the element AND pastes the
-// clipboard itself, in one step — exactly what you do when clipping by hand.
-// (The host used to send Alt+N + Ctrl+V; Alt+N is "Add a note", which makes a
-// blank element and ignores the clipboard, and the follow-up Ctrl+V often
-// landed on the Contents window where it means "Paste element" and rejected
-// the HTML — that was the error.) The popup usually closes itself the moment
-// focus jumps to SuperMemo, so success is mostly seen via SuperMemo receiving
-// the paste; error/status paths stay readable here.
+// After copying, the native host brings SuperMemo to the foreground and sends
+// Ctrl+N, which is SuperMemo's "Add a new article": it creates the element AND
+// pastes the clipboard itself, in one step — exactly what you do when clipping
+// by hand. (The host used to send Alt+N + Ctrl+V; Alt+N is "Add a note", which
+// makes a blank element and ignores the clipboard, and the follow-up Ctrl+V
+// often landed on the Contents window where it means "Paste element" and
+// rejected the HTML — that was the error.)
+//
+// The host has to *fight* for the foreground to do this, because SendKeys goes
+// to whatever window owns it. That is why a run can end with SuperMemo merely
+// flashing instead of pasting, and why the host now verifies the foreground
+// before sending, reports which window received the key, and writes what
+// happened to %TEMP%\supermemo-clipper-last.json for the 诊断 button to show.
+//
+// The page URL travels with the native message for one reason: Chrome stamps
+// the clipboard with the URL of the document that copied it, and here that
+// document is this popup (chrome-extension://.../popup/popup.html). SuperMemo
+// pastes into an IE (mshtml) component, IE cannot use a chrome-extension URL as
+// the note's base URL, so it falls back to its internal res:// base — which is
+// what makes Windows pop "How do you want to open this 'res' link?". The host
+// rewrites that SourceURL to the real page before pressing Ctrl+N, so the
+// automatic path looks exactly like a manual Ctrl+C.
 "use strict";
 
 const statusEl = document.getElementById("status");
 const runBtn = document.getElementById("run");
+const verEl = document.getElementById("ver");
+const diagEl = document.getElementById("diag");
+const diagBtn = document.getElementById("diagBtn");
 const modeInputs = Array.from(document.querySelectorAll('input[name="mode"]'));
 const NATIVE_HOST = "com.supermemo.paster.v2";
 const DEFAULT_MODE = "article";
@@ -45,6 +61,33 @@ let busy = false;
 function setStatus(text, cls) {
   statusEl.textContent = text;
   statusEl.className = cls || "";
+}
+
+// Version badge source. It answers the one question that keeps coming up when a
+// fix "does not work": is the extension that is actually running the fixed
+// code? chrome://extensions shows the same number — if it is older, the
+// extension has not been reloaded and nothing on disk matters. It also travels
+// to the native host so its log says which build produced a paste.
+function extensionVersion() {
+  try {
+    return chrome.runtime.getManifest().version || "";
+  } catch (_) {
+    return "";
+  }
+}
+
+function lockUI(locked) {
+  busy = locked;
+  modeInputs.forEach((i) => { i.disabled = locked; });
+  runBtn.disabled = locked;
+  diagBtn.disabled = locked;
+}
+
+function shortTitle(s, n) {
+  const t = String(s || "").replace(/\s+/g, " ").trim();
+  if (!t) return "（无标题窗口）";
+  const max = n || 18;
+  return t.length > max ? t.slice(0, max) + "…" : t;
 }
 
 function currentMode() {
@@ -80,12 +123,6 @@ async function saveModeFor(h, mode) {
     siteModes[h] = mode;
     await chrome.storage.local.set({ siteModes });
   } catch (_) { /* private mode / storage unavailable: not worth failing over */ }
-}
-
-function lockUI(locked) {
-  busy = locked;
-  modeInputs.forEach((i) => { i.disabled = locked; });
-  runBtn.disabled = locked;
 }
 
 async function extractWith(mode) {
@@ -145,34 +182,68 @@ async function run(mode) {
 
     await copyToClipboard(data.html, data.text);
 
-    // Native host path: auto new-element + paste inside SuperMemo.
+    // Native host path: rewrite the clipboard's source URL, auto new-element +
+    // paste inside SuperMemo. The page URL must go with the message — it is the
+    // base URL SuperMemo's IE component needs, and only the page itself knows
+    // it.
     let resp = null;
     try {
-      resp = await chrome.runtime.sendNativeMessage(NATIVE_HOST, { action: "new_and_paste" });
+      resp = await chrome.runtime.sendNativeMessage(NATIVE_HOST, {
+        action: "new_and_paste",
+        pageUrl: (data.url || tab.url || ""),
+        version: extensionVersion()
+      });
     } catch (_) {
       resp = null; // host not registered / browser disconnected
     }
 
     const meta = data.meta || {};
-    const size = meta.chars
-      ? "（" + (meta.blocks ? meta.blocks + " 条消息 · " : "") + meta.chars + " 字）"
-      : "";
+    // What the note ended up containing. Handy when something looks wrong in
+    // SuperMemo: the counts say whether the page had little content or whether
+    // the cleaner threw things away, and "丢弃 N" is exactly the number of
+    // images/links dropped because their URL could not be made safe+absolute.
+    const u = meta.urls || {};
+    const bits = [];
+    if (meta.blocks) bits.push(meta.blocks + " 条消息");
+    if (meta.chars) bits.push(meta.chars + " 字");
+    if (u.img || u.link) bits.push("图 " + (u.img || 0) + " · 链 " + (u.link || 0));
+    const dropped = (u.imgDropped || 0) + (u.linkDropped || 0) + (u.scrubbed || 0);
+    if (dropped) bits.push("丢弃 " + dropped + " 个无效链接");
+    const size = bits.length ? "（" + bits.join(" · ") + "）" : "";
     const head = notice + (mode === "full" ? "【全页】" : "【正文】");
 
+    // The clipboard's SourceURL is what SuperMemo's IE component uses as the
+    // note's base URL. "fixed" means it now points at the page instead of at
+    // this popup, i.e. the res:// dialog cannot happen for this paste. Say so,
+    // because that is the invisible half of the work.
+    const srcNote = resp && resp.sourceStatus === "fixed" ? " · 来源地址已修正" : "";
+
     if (resp && resp.ok) {
-      setStatus(head + "已新建条目并粘贴到 SuperMemo" + size, "ok");
+      // "收件窗口" is the window that owned the foreground when the key went
+      // out. If it says SuperMemo, the keystroke landed in SuperMemo; if it
+      // says anything else, the paste went somewhere else — which is the whole
+      // failure mode this field exists to expose.
+      const got = resp.fg ? " · 收件窗口：" + shortTitle(resp.fg, 14) : "";
+      setStatus(head + "已新建条目并粘贴到 SuperMemo" + size + got + srcNote, "ok");
       setTimeout(() => window.close(), 1400);
     } else if (resp && resp.code === "not_running") {
       setStatus(head + "SuperMemo 未运行，内容已在剪贴板" + size + "，打开后按 Ctrl+N 即可", "warn");
       // Keep the popup open so the hint stays readable.
     } else if (resp && resp.code === "activate_failed") {
-      setStatus(head + "已复制" + size + "，但无法激活 SuperMemo 窗口，请在 SuperMemo 里手动按 Ctrl+N", "warn");
+      // The key would have gone to some other program, so don't pretend it was
+      // pasted. Say who was holding the foreground instead.
+      const who = resp.fg ? "（当前前台是「" + shortTitle(resp.fg, 14) + "」）" : "";
+      setStatus(head + "已复制" + size + "，但没能把 SuperMemo 切到前台" + who +
+        "，请在 SuperMemo 里手动按 Ctrl+N", "warn");
+      diagEl.style.display = "block";
+      diagEl.textContent = "点右下角「诊断」看详细原因。";
     } else if (resp && resp.code === "clipboard_empty") {
       setStatus(head + "提取成功" + size + "，但剪贴板里没有内容（可能被其他程序占用），请重试", "warn");
     } else if (resp && resp.error) {
       setStatus(head + "已复制" + size + "，自动粘贴失败：" + resp.error, "warn");
     } else {
-      setStatus(head + "已复制" + size + "。native host 未注册，请先运行 native\\install.ps1；此后可自动粘贴", "warn");
+      setStatus(head + "已复制" + size + "。native host 未注册，请先运行 native\\install.ps1；" +
+        "此后可自动粘贴（未注册时 SuperMemo 可能弹 res:// 对话框，因为没人为你把剪贴板来源地址改成网页地址）", "warn");
     }
   } catch (e) {
     setStatus("失败：" + String(e && e.message || e), "err");
@@ -246,6 +317,12 @@ async function loadChatHistory() {
 }
 
 (async () => {
+  // Version badge. It answers the one question that keeps coming up when a fix
+  // "does not work": is the extension that is actually running the fixed code?
+  // chrome://extensions shows the same number — if it is older, the extension
+  // has not been reloaded and nothing on disk matters.
+  if (verEl) verEl.textContent = "剪藏 v" + (extensionVersion() || "?");
+
   try {
     const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
     tab = active;
@@ -281,10 +358,121 @@ async function loadChatHistory() {
     });
 
     runBtn.addEventListener("click", () => run(currentMode()));
+    diagBtn.addEventListener("click", runDiagnose);
   } catch (e) {
     setStatus("失败：" + String(e && e.message || e), "err");
   }
 })();
+
+// "Why did nothing happen?" answered from the host side. This is the one call
+// that does NOT paste: it reports clipboard state, the SuperMemo process, how
+// many top-level windows it keeps, whether the host can actually take the
+// foreground away from Chrome, and what the host recorded the last time 提取
+// was pressed. That record lives in %TEMP%\supermemo-clipper-last.json — it has
+// to, because SuperMemo stealing the focus usually closes this popup before any
+// result could be shown in it.
+async function runDiagnose() {
+  if (busy) return;
+  lockUI(true);
+  diagEl.style.display = "block";
+  diagEl.textContent = "正在检查…";
+  try {
+    let resp = null;
+    try {
+      resp = await chrome.runtime.sendNativeMessage(NATIVE_HOST, {
+        action: "diagnose",
+        pageUrl: (tab && tab.url) || "",
+        version: extensionVersion()
+      });
+    } catch (_) {
+      resp = null;
+    }
+    if (!resp) {
+      diagEl.textContent =
+        "native host 没有响应——它还没注册，或注册表里指向的路径不对。\n" +
+        "请在仓库里运行：powershell -ExecutionPolicy Bypass -File native\\install.ps1";
+      setStatus("诊断失败：native host 无响应", "err");
+      return;
+    }
+    if (resp.code === "not_running") {
+      diagEl.textContent = "SuperMemo 没有运行。";
+      setStatus("诊断完成：SuperMemo 未运行", "warn");
+      return;
+    }
+    diagEl.textContent = formatDiagnosis(resp);
+    setStatus("诊断完成（没有新建条目、没有发出按键）", "ok");
+  } catch (e) {
+    diagEl.textContent = "诊断失败：" + String((e && e.message) || e);
+  } finally {
+    lockUI(false);
+  }
+}
+
+function formatDiagnosis(r) {
+  const L = [];
+  L.push("==== 本次检查 ====");
+  L.push("剪贴板：" + (r.clipboardTextLen || 0) + " 字" +
+    (r.clipboardHasHtml ? " + HTML" : "（没有 HTML）"));
+  if (r.clipboardFormats && r.clipboardFormats.length) {
+    L.push("  格式：" + r.clipboardFormats.join(" / "));
+  }
+  if (r.clipboardProbeError) L.push("  探测失败：" + r.clipboardProbeError);
+
+  // The clipboard's SourceURL is the note's base URL inside SuperMemo's IE
+  // component. When it points at this popup, IE cannot use it and falls back to
+  // res://, which is the Windows "open this 'res' link?" dialog.
+  const SRC_HINT = {
+    "would-fix": "→ 粘贴前会被改写成上面的网页地址",
+    "current": "→ 已经是网页地址，正常",
+    "skipped": "→ 不改写（原因见下）",
+    "verify-failed": "← 改写没通过校验，会按原样粘贴"
+  };
+  if (r.clipSourceUrl || r.clipSourceStatus) {
+    L.push("剪贴板来源地址（SourceURL）：" +
+      (r.clipSourceUrl || "（没有）"));
+    if (r.clipSourceStatus && SRC_HINT[r.clipSourceStatus]) {
+      L.push("  " + SRC_HINT[r.clipSourceStatus]);
+    } else if (r.clipSourceStatus) {
+      L.push("  状态：" + r.clipSourceStatus);
+    }
+    if (r.clipSourceDetail) L.push("  说明：" + r.clipSourceDetail);
+  }
+
+  L.push("SuperMemo：" + (r.smProcess || "?") + " (pid " + (r.smPid || "?") + ")，" +
+    "可见顶层窗口 " + (r.windowCount || 0) + " 个");
+  L.push("能否从 Chrome 手里接管前台：" +
+    (r.foregroundTaken ? "可以（第 " + r.attempts + " 次尝试成功）"
+                       : "不可以 ← 这就是粘贴失败的原因"));
+  if (r.foregroundTitle) L.push("  接管后前台：" + shortTitle(r.foregroundTitle, 30));
+
+  const p = r.previousRun;
+  L.push("");
+  L.push("==== 上次点「提取」时宿主记录到的实况 ====");
+  if (!p) {
+    L.push("（还没有记录。装好新版后点一次「提取」再来看）");
+  } else {
+    L.push("时间：" + (p.ts || "?"));
+    L.push("扩展版本：" + (p.extension_version || "（旧版没上报）"));
+    L.push("结果：" + (p.result || "?"));
+    if (p.foreground_attempts != null) L.push("抢前台尝试：" + p.foreground_attempts + " 次");
+    if (p.foreground_title) L.push("发键时前台：" + shortTitle(p.foreground_title, 30));
+    if (p.foreground_after) L.push("发键后前台：" + shortTitle(p.foreground_after, 30));
+    if (p.sm_windows_before != null) {
+      L.push("SuperMemo 窗口数：" + p.sm_windows_before + " → " + p.sm_windows_after);
+    }
+    L.push("剪贴板：" + (p.clipboard_text_len || 0) + " 字" +
+      (p.clipboard_has_html ? " + HTML" : "（没有 HTML）"));
+    if (p.clipboard_rewrite) {
+      L.push("来源地址改写：" + p.clipboard_rewrite +
+        (p.clipboard_source_before ? "（" + shortTitle(p.clipboard_source_before, 44) + "）" : ""));
+      if (p.clipboard_rewrite_detail) L.push("  说明：" + p.clipboard_rewrite_detail);
+    }
+    if (p.page_url) L.push("页面：" + shortTitle(p.page_url, 60));
+    if (p.error) L.push("错误：" + p.error);
+  }
+  if (r.log) { L.push(""); L.push("日志文件：" + r.log); }
+  return L.join("\n");
+}
 
 async function copyToClipboard(html, text) {
   if (navigator.clipboard && typeof ClipboardItem === "function") {

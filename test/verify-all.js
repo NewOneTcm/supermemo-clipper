@@ -10,6 +10,11 @@
 // [B] WeChat article — the case article mode was built for. Guards the
 //     <section>→<p> paragraph preservation, lazy data-src promotion and the
 //     mmbiz tp=webp strip against the v2.1 sanitize refactor.
+// [C] URL hygiene — scheme whitelist + absolutisation. A relative URL is itself
+//     a bug: an IE-rendered note has no base URL, so relative URLs resolve into
+//     IE's internal res:// scheme, which modern IE no longer serves → Windows
+//     pops "How do you want to open this 'res' link?". checkNoRelative() is run
+//     against every fixture; [D] is the real page that reported it.
 //
 //   node test/verify-all.js
 "use strict";
@@ -200,9 +205,34 @@ if (wxFull) {
 // [C] URL hygiene — the "How do you want to open this 'res' link?" dialog.
 //     SuperMemo renders notes in an IE component, which punts schemes it cannot
 //     handle to ShellExecute. res:// is the IE-internal resource scheme, so a
-//     single <img src="res://…"> in the page is enough to pop a Windows dialog
-//     on paste. Relative paths are broken too (a note has no base document).
+//     single bad URL in the note is enough to pop a Windows dialog on paste.
+//     The subtler half: IE resolves RELATIVE urls against the document base,
+//     and a clipboard-pasted note has no base URL (unlike SuperMemo's own Web
+//     Import, which stores one) — so relative paths are not merely broken,
+//     they can come out as res:// URLs too. Hence: every URL in the output must
+//     be absolute. checkNoRelative() enforces that everywhere.
 const URL_PAGE_URL = "https://example.com/posts/url-test";
+
+// Any href/src that is not absolute (no scheme). A fragment like "#top" counts
+// as relative — that was the last remaining hole.
+function relativeUrls(html) {
+  const bad = [];
+  const re = /\b(href|src)\s*=\s*"([^"]*)"/gi;
+  let m;
+  while ((m = re.exec(html))) {
+    const v = (m[2] || "").trim();
+    if (!v) { bad.push(m[1] + '=""'); continue; }
+    if (/^[a-z][a-z0-9+.-]*:/i.test(v)) continue; // https: / mailto: / data:
+    bad.push(m[1] + '="' + v + '"');
+  }
+  return bad;
+}
+
+function checkNoRelative(label, html) {
+  const bad = relativeUrls(html);
+  check(label + " -> 输出中无相对 URL（含 #锚点）", bad.length === 0,
+    bad.slice(0, 5).join(" ") || "ok");
+}
 
 const urlPage = `<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>URL 卫生</title></head>
@@ -242,10 +272,174 @@ if (hygiene) {
     /href="https:\/\/example\.com\/help\/index\.html"/i.test(hygiene.html));
   check("绝对链接原样保留",
     /href="https:\/\/example\.com\/ok"/i.test(hygiene.html));
-  check("页内锚点保留", /href="#top"/i.test(hygiene.html));
+  // A bare "#top" used to survive as-is. It is a relative URL like any other,
+  // so it is now resolved against the page URL.
+  check("页内锚点补成绝对",
+    /href="https:\/\/example\.com\/posts\/url-test#top"/i.test(hygiene.html),
+    (hygiene.html.match(/<a[^>]*>/g) || []).join(" "));
   const imgCount = (hygiene.html.match(/<img[^>]*>/g) || []).length;
   check("只剩 2 张可用图片（内联 + 相对路径）", imgCount === 2, "img=" + imgCount);
+  check("meta.urls 统计正确（图 2/丢 4，链 3/去 2）",
+    hygiene.meta && hygiene.meta.urls &&
+    hygiene.meta.urls.img === 2 && hygiene.meta.urls.imgDropped === 4 &&
+    hygiene.meta.urls.link === 3 && hygiene.meta.urls.linkDropped === 2,
+    JSON.stringify(hygiene.meta && hygiene.meta.urls));
+  checkNoRelative("URL 卫生", hygiene.html);
 }
+
+// [D] The page that produced the second "still res://" report: a book-style
+//     single-pager whose only images are RELATIVE ("ads/*.webp") and whose list
+//     items link to bare "#e-XX-XX" anchors. Both used to leave relative URLs in
+//     the note, and a relative URL in an IE-rendered note resolves against a
+//     base the note does not have.
+const HTLB_URL = "https://example.com/book/#e-34-10";
+
+const htlbPage = `<!DOCTYPE html>
+<html><head>
+  <meta charset="utf-8"><title>高性价比人生指南</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'/%3E">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter">
+  <style>.ad { float: right; }</style>
+</head>
+<body>
+  <div id="list">
+    <article id="e-34-10">
+      <h3>第 34.10 条 服务器选型</h3>
+      <p>这一段是条目正文，要有一定长度，才能让整页模式把它当作真正的段落保留下来。这里继续补一些无害的文字，把这段凑到正常段落的长度，不然会被当成无关的一行清掉。</p>
+      <p><a href="#e-34-11">下一条</a> · <a href="../docs/做平台要办哪些证.md">延伸阅读</a></p>
+    </article>
+  </div>
+  <div class="ad">
+    <img src="ads/mcyyy-side.webp" alt="广告横幅" width="624" height="312" loading="lazy">
+    <img src="ads/wechat-reward.png" alt="赞赏码" width="1037" height="1037" loading="lazy">
+  </div>
+  <noscript><p>本页的筛选功能需要 JavaScript。</p></noscript>
+  <aside class="sidebar">
+    <img src="ads/sidebar-only.webp" alt="侧栏图">
+    <a href="ads/sidebar-link.md">侧栏链接</a>
+  </aside>
+  <script>fetch("README.md", {cache:"no-cache"});</script>
+</body></html>`;
+
+const htlb = run("[D] 书本式单页（相对图片 + #锚点）/ full mode", htlbPage, HTLB_URL, "full",
+  "高性价比人生指南", {
+    must: ["第 34.10 条", "下一条", "延伸阅读"],
+    mustNot: ["本页的筛选功能需要 JavaScript"]
+  });
+
+if (htlb) {
+  check("相对广告图补成绝对",
+    /src="https:\/\/example\.com\/book\/ads\/mcyyy-side\.webp"/i.test(htlb.html),
+    (htlb.html.match(/<img[^>]*>/g) || []).join(" "));
+  check("相对 .webp 未被误删", /mcyyy-side\.webp/.test(htlb.html) &&
+    /wechat-reward\.png/.test(htlb.html));
+  check("##锚点补成绝对（本次修复的核心）",
+    /href="https:\/\/example\.com\/book\/#e-34-11"/i.test(htlb.html),
+    (htlb.html.match(/<a[^>]*>/g) || []).join(" "));
+  check("相对 md 链接补成绝对",
+    /href="https:\/\/example\.com\/docs\//i.test(htlb.html));
+  // The real page keeps its ads in <aside class="sidebar">. Whole-page mode
+  // drops that whole subtree as page chrome — and the TreeWalker still walks
+  // into it, so the URL tallies must not count what is about to be deleted.
+  check("侧栏（页面外壳）整块删除", !/sidebar-only|侧栏链接/.test(htlb.html));
+  check("被删子树内的图片/链接不计入 meta.urls（防统计虚高）",
+    htlb.meta && htlb.meta.urls &&
+    htlb.meta.urls.img === 2 && htlb.meta.urls.imgDropped === 0 &&
+    htlb.meta.urls.link === 2 && htlb.meta.urls.linkDropped === 0,
+    JSON.stringify(htlb.meta && htlb.meta.urls));
+  checkNoRelative("书本式单页", htlb.html);
+}
+
+// Same invariant on every other fixture — it is what keeps the Windows dialog
+// away, so it should never regress anywhere.
+if (chatFull) checkNoRelative("ChatGPT full", chatFull.html);
+if (wx) checkNoRelative("WeChat article", wx.html);
+if (wxFull) checkNoRelative("WeChat full", wxFull.html);
+
+// [E] IE conditional comments — the one carrier a DOM-based cleaner cannot see.
+//     <!--[if IE]><img src="/x.png"><![endif]--> is a *comment* to Chrome, so
+//     sanitize()'s TreeWalker never visits the img inside it, and the comment
+//     is serialised back out verbatim. Internet Explorer, however, renders the
+//     content as real markup — and IE is what SuperMemo uses. A relative URL
+//     hidden in there therefore used to survive the whole pipeline and still
+//     pop the res:// dialog. Comments are now removed outright.
+const ccPage = `<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>条件注释</title></head>
+<body>
+  <div class="post">
+    <p>这一段正文要足够长，才能让整页模式把它当成真正的段落留下来。继续补一些无害的文字，让这段内容看起来像一篇正常的长文章，而不是页面上可有可无的一行提示。</p>
+    <!--[if IE]><img src="/hidden/ie-only.png" alt="IE 专属图"><![endif]-->
+    <!-- 普通注释也一并去掉 -->
+    <p>结尾段落，同样需要一点长度，避免被当成无关的一行清掉。补充说明性文字，凑够长度即可。</p>
+  </div>
+</body></html>`;
+
+const cc = run("[E] IE 条件注释 / full mode", ccPage, "https://example.com/ie/", "full", "条件注释", {
+  must: ["这一段正文要足够长", "结尾段落"],
+  mustNot: ["IE 专属图"]
+});
+
+if (cc) {
+  check("注释整段删除（不留 <!-- -->）", !/<!--/.test(cc.html), cc.html.slice(0, 160));
+  check("条件注释里的隐藏 img 不再出现在笔记里",
+    !/ie-only\.png/.test(cc.html) && !/hidden/.test(cc.html));
+  // The comment is removed in sanitize(), so the last-resort net has nothing
+  // left to do here — which is the healthy state. [F] proves the net works.
+  check("注释已在 sanitize 阶段消化，兜底网无需出手",
+    !(cc.meta && cc.meta.urls && cc.meta.urls.scrubbed),
+    JSON.stringify(cc.meta && cc.meta.urls));
+  checkNoRelative("条件注释页", cc.html);
+}
+
+// [F] The last-resort net in build().
+//     sanitize() is the mechanism; this is the guarantee. It runs on the
+//     finished note as a string, so even a future change that bypasses or
+//     breaks sanitize() cannot put a URL IE would resolve relatively into the
+//     clipboard. Called directly (not through the extractors) because the
+//     point is what happens to input sanitize() would already have fixed.
+console.log("\n[ F ] build() 兜底 URL 网");
+
+const { JSDOM } = require("jsdom");
+const fs2 = require("fs");
+const path2 = require("path");
+const clipDom = new JSDOM("<!doctype html><body></body>", {
+  url: "https://example.com/p/", runScripts: "outside-only"
+});
+clipDom.window.eval(
+  fs2.readFileSync(path2.join(__dirname, "..", "content", "common.js"), "utf8"));
+
+const clip = clipDom.window.__smClip;
+const nastyStats = { scrubbed: 0 };
+const nastyNote = clip.build(
+  '<p><a href="/relative.html">rel</a>' +
+  '<a href="#anchor">anchor</a>' +
+  '<a href="res://ieframe.dll/dnserrordiagoff.htm">res</a>' +
+  '<a href="javascript:void(0)">js</a>' +
+  '<a href="blob:https://example.com/x">blob</a>' +
+  '<img src="/relative.png">' +
+  '<img src="res://ieframe.dll/http_404.htm">' +
+  '<img src="https://example.com/ok.png">' +
+  '<img src="data:image/png;base64,iVBORw0KGgo="></p>',
+  "T", "https://example.com/p/", nastyStats);
+
+check("兜底网删掉了 7 个坏 href/src（5 链 + 2 图）", nastyStats.scrubbed === 7,
+  "scrubbed=" + nastyStats.scrubbed);
+check("兜底网后仍无相对 URL", /^$/.test(relativeUrls(nastyNote.html).join("")),
+  relativeUrls(nastyNote.html).join(" "));
+check("兜底网留下的元素只被去掉属性（a/img 还在）",
+  /<a>rel<\/a>/.test(nastyNote.html) && /<img><img>/.test(nastyNote.html),
+  nastyNote.html.slice(0, 200));
+check("兜底网保留正常绝对链接", /href="https:\/\/example\.com\/ok"/.test(
+  clip.build('<p><a href="https://example.com/ok">ok</a></p>', "T", "", {}).html));
+check("兜底网保留内联 data:image",
+  /src="data:image\/png;base64,iVBORw0KGgo="/.test(nastyNote.html));
+check("干净输入不会被误伤（scrubbed 保持 0）", (() => {
+  const s = {};
+  const out = clip.build('<p><a href="https://a.com/x">x</a><img src="https://a.com/i.png"></p>',
+    "T", "https://a.com/", s);
+  return out.html.includes('href="https://a.com/x"') &&
+         out.html.includes('src="https://a.com/i.png"') && !s.scrubbed;
+})(), "scrubbed must stay unset");
 
 console.log("\n" + (failures ? failures + " check(s) FAILED" : "all checks passed"));
 process.exit(failures ? 1 : 0);

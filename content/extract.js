@@ -24,8 +24,16 @@
     var title = article.title || document.title || "";
     var url = location.href;
     // baseUrl lets common.js promote relative src/href to absolute ones — the
-    // note has no document of its own to resolve them against.
-    return api.build(api.sanitize(article.content, { baseUrl: url }), title, url);
+    // note has no document of its own to resolve them against, and a relative
+    // URL in an IE-rendered note comes out as a res:// URL (Windows error
+    // dialog), so nothing relative may survive.
+    var stats = { img: 0, imgDropped: 0, link: 0, linkDropped: 0 };
+    var bodyHtml = api.sanitize(article.content, { baseUrl: url, stats: stats });
+    // The same stats object goes into build() so its final URL net can report
+    // anything it had to delete (stats.scrubbed). Expected to stay 0.
+    var out = api.build(bodyHtml, title, url, stats);
+    out.meta = { scope: "article", chars: out.text.length, urls: stats };
+    return out;
   } catch (e) {
     return { ok: false, error: String(e && e.message || e) };
   }
