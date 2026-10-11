@@ -11,11 +11,17 @@
 # "SuperMemo flashed once but nothing was pasted" symptom: the key went to
 # Chrome, not to SuperMemo. So we now
 #   (a) take the foreground with the AttachThreadInput trick,
-#   (b) VERIFY with GetForegroundWindow that a SuperMemo window really owns it,
-#       re-asserting in a short loop — Chrome also grabs focus back at the
-#       moment its action popup closes, which is what made this a race,
+#   (b) VERIFY that SuperMemo really has the KEYBOARD - not merely that it is in
+#       front. Two separate things, and mixing them up is what made the paste
+#       silently do nothing: SuperMemo's TApplication frame can be the
+#       foreground window AND hold the focus, and a key delivered there is
+#       dropped. See the Get-SmWindows comment below for the measurement,
 #   (c) only then send Ctrl+N, and re-check afterwards who owns the foreground,
 #   (d) write what actually happened to %TEMP%\supermemo-clipper-last.json.
+#
+# There is also a { "action": "selftest" } that proves the keystroke path works
+# without creating anything, by pressing Ctrl+F and watching for SuperMemo's
+# Find dialog to appear.
 #
 # Two actions, both taken from the JSON message on stdin:
 #   { "action": "new_and_paste" }  default: clipboard guard -> Ctrl+N
@@ -130,11 +136,21 @@ function Get-ClipboardState {
     return $s
 }
 
+# Is this process name a SuperMemo build? Its executables are sm<version>.exe
+# (sm20, sm19, sm2004, sm8, ...). A plain "sm*" wildcard also matches smss.exe,
+# the Windows Session Manager, which has no windows and no user session: with
+# SuperMemo simply not running, the host then picked smss up and reported
+# "SuperMemo has no visible top-level window" instead of "SuperMemo not running".
+function Test-SmProcessName($name) {
+    if (-not $name) { return $false }
+    return ($name -match '(?i)^sm\d') -or ($name -match '(?i)supermemo')
+}
+
 function Get-SmProcess {
-    $p = Get-Process | Where-Object { $_.MainWindowHandle -ne 0 -and $_.ProcessName -like "sm*" } |
+    $p = Get-Process | Where-Object { $_.MainWindowHandle -ne 0 -and (Test-SmProcessName $_.ProcessName) } |
          Select-Object -First 1
     if (-not $p) {
-        $p = Get-Process | Where-Object { $_.ProcessName -like "sm*" } | Select-Object -First 1
+        $p = Get-Process | Where-Object { Test-SmProcessName $_.ProcessName } | Select-Object -First 1
     }
     return $p
 }
@@ -143,37 +159,154 @@ function Get-SmProcess {
 # byte surgery on the clipboard stream, and it is tested on its own.
 . (Join-Path $helperRoot "cfhtml.ps1")
 
-# SuperMemo keeps several top-level windows (element windows are titled with the
-# element, plus Contents / Read / Statistics ...). Any of them owning the
-# foreground is enough — Ctrl+N is an application-level shortcut — so the
-# verifier only ever compares process ids, never handles.
+# SuperMemo keeps several top-level windows, and WHICH one we activate decides
+# whether the paste happens at all. Measured on this machine (SuperMemo 20):
+#
+#   class          title                             role
+#   TElWind        the element's own text            element window  <- keys dispatch here
+#   TElDataWind    "Topic #62,788: ..."              element data window
+#   TApplication   "MYBRAIN (SuperMemo 20: d:\...)"  application frame  <- NOT interactive
+#   TContents      "Read"                            knowledge tree
+#   TAncestors / TStats / TStatBar / TBack / ...     panels
+#
+# .NET reports the TApplication frame as MainWindowHandle, and that frame used to
+# go into the candidate list first. Activating it does bring SuperMemo forward,
+# so the old pid check was happy and the host reported success — but the frame
+# ends up holding the keyboard focus itself, and a keystroke delivered there
+# never reaches the application's shortcut dispatcher. Ctrl+N did nothing at all,
+# in BOTH extraction modes: the "no reaction" report.
+#
+# So element windows go first, and z-order picks between them: the topmost
+# visible element window is the one the user last worked in, which also means
+# the article is added next to the element on screen.
+$ELEMENT_WINDOW_CLASSES = @("TElWind", "TElDataWind")
+# Pure framework noise; never a valid activation target.
+$NOISE_WINDOW_CLASSES = @("TPUtilWindow", "ComboLBox", "MSCTFIME UI", "IME", "CandidateWindow")
+# Window classes that SWALLOW a keystroke. The element window embeds Internet
+# Explorer, and activating it parks the focus on that embedded host — measured
+# with SetForegroundWindow, BringWindowToTop, SwitchToThisWindow and with a
+# frame-then-element double activation alike. Keys delivered to those windows
+# are consumed by IE and never reach SuperMemo's shortcut dispatcher; that is
+# the remaining half of the "no reaction" bug, and it is why the host now puts
+# the focus on one of SuperMemo's own controls instead (see Test-Keyboard).
+$SWALLOWING_FOCUS_CLASSES = @("Shell Embedding", "Shell DocObject View",
+    "Internet Explorer_Server", "Internet Explorer_Hidden", "OimeTsfNotifyWindow",
+    "TApplication", "TSMMain", "TPUtilWindow")
+
 function Get-SmWindows($proc) {
-    $list = New-Object System.Collections.ArrayList
-    if ($proc.MainWindowHandle -ne 0) { [void]$list.Add([IntPtr]$proc.MainWindowHandle) }
-    foreach ($h in [FG]::VisibleWindowsOf([uint32]$proc.Id)) {
+    $smPid = [uint32]$proc.Id
+    $elements = New-Object System.Collections.ArrayList
+    $others = New-Object System.Collections.ArrayList
+    $seen = @{}
+    foreach ($h in [FG]::TopLevelWindowsOf($smPid)) {
         $p = [IntPtr]$h
-        if ($p -ne [IntPtr]$proc.MainWindowHandle) { [void]$list.Add($p) }
+        $cls = [FG]::ClassName($p)
+        if ($NOISE_WINDOW_CLASSES -contains $cls) { continue }
+        if (-not [FG]::IsVisible($p)) { continue }
+        # A window with no title is a panel / hidden IE host, never a target.
+        if ([FG]::Title($p) -eq "") { continue }
+        $seen[$h] = $true
+        if ($ELEMENT_WINDOW_CLASSES -contains $cls) { [void]$elements.Add($p) }
+        else { [void]$others.Add($p) }
     }
-    return ,$list
+    # The .NET "main window" stays reachable as a last resort: if SuperMemo has
+    # no element window open at all, trying it still beats refusing.
+    $main = [IntPtr]$proc.MainWindowHandle
+    if ($main -ne [IntPtr]::Zero -and -not $seen.ContainsKey([int64]$main)) {
+        [void]$others.Add($main)
+    }
+    $out = New-Object System.Collections.ArrayList
+    foreach ($p in $elements) { [void]$out.Add($p) }
+    foreach ($p in $others) { [void]$out.Add($p) }
+    if ($out.Count -eq 0) {
+        # Everything was filtered away — take whatever is visible.
+        foreach ($h in [FG]::TopLevelWindowsOf($smPid)) {
+            $p = [IntPtr]$h
+            if ([FG]::IsVisible($p)) { [void]$out.Add($p) }
+        }
+    }
+    return ,$out
+}
+
+# The class of the window that currently holds the keyboard inside SuperMemo
+# ("" when SuperMemo holds no focus at all, e.g. while another app is in front).
+function Get-SmFocusClass($smPid) {
+    $h = [FG]::FocusWindow($smPid)
+    if ($h -eq 0) { return "" }
+    return [FG]::ClassName([IntPtr]$h)
+}
+
+# The question that decides whether Ctrl+N works at all. Three things must hold,
+# and only the third is unusual:
+#   1. SuperMemo owns the foreground,
+#   2. one of SuperMemo's windows owns the keyboard,
+#   3. that window is one of its OWN controls (a VCL class, "T..."), and not a
+#      top-level form and not the embedded IE host.
+# No activation recipe satisfies (3) on its own — none of them did in a measured
+# matrix of six. Handing the focus to a VCL control is what makes the identical
+# keystroke work, which is exactly what a human does by clicking in SuperMemo
+# before pressing Ctrl+N.
+function Test-Keyboard($smPid) {
+    $fgPid = [FG]::ForegroundPid()
+    $h = [FG]::FocusWindow($smPid)
+    $cls = ""
+    if ($h -ne 0) { $cls = [FG]::ClassName([IntPtr]$h) }
+    $isChild = ($h -ne 0) -and ([FG]::GetAncestor([IntPtr]$h, 2) -ne [IntPtr]$h)
+    $ok = ($fgPid -eq $smPid) -and $isChild -and $cls.StartsWith("T") -and
+          ($SWALLOWING_FOCUS_CLASSES -notcontains $cls)
+    return @{ ok = $ok; cls = $cls; handle = $h; fgPid = $fgPid }
 }
 
 function Set-ForegroundVerified($candidates, $smPid, $shell, $timeoutMs) {
+    # Fast path: if SuperMemo already has the keyboard, touch nothing. Forcing a
+    # window now would only move the focus into the embedded IE host.
+    $kb = Test-Keyboard $smPid
+    if ($kb.ok) {
+        return @{
+            ok = $true; attempts = 0; hands = 0
+            title = [FG]::ForegroundTitle()
+            focus = $kb.cls
+            target = "already-focused"
+            targetTitle = [FG]::ForegroundTitle()
+            targetHandle = 0
+        }
+    }
+
     $deadline = (Get-Date).AddMilliseconds($timeoutMs)
     $attempts = 0
+    $hands = 0
+    $target = $candidates[0]
     while ((Get-Date) -lt $deadline) {
         $target = $candidates[$attempts % $candidates.Count]
         [void][FG]::Force($target)
         Start-Sleep -Milliseconds 90
         $attempts++
-        if ([FG]::ForegroundPid() -eq $smPid) { break }
+        $kb = Test-Keyboard $smPid
+        if ($kb.ok) { break }
+        if ($kb.fgPid -eq $smPid) {
+            # In front, but the keyboard is in the embedded IE host: hand it to
+            # one of SuperMemo's own controls and look again.
+            if ([FG]::FocusVclControl([int64]$target) -ne 0) {
+                $hands++
+                Start-Sleep -Milliseconds 70
+                $kb = Test-Keyboard $smPid
+                if ($kb.ok) { break }
+            }
+        }
         # Secondary path: WScript's AppActivate sometimes succeeds where the
         # direct call was refused (it uses a different internal route).
         if ($attempts % 3 -eq 0) { [void]$shell.AppActivate("SuperMemo") }
     }
+    $kb = Test-Keyboard $smPid
     return @{
-        ok = ([FG]::ForegroundPid() -eq $smPid)
+        ok = $kb.ok
         attempts = $attempts
+        hands = $hands
         title = [FG]::ForegroundTitle()
+        focus = $kb.cls
+        target = [FG]::ClassName($target)
+        targetTitle = [FG]::Title($target)
+        targetHandle = [int64]$target
     }
 }
 
@@ -244,8 +377,13 @@ try {
     $candidates = Get-SmWindows $proc
     Set-Diag "sm_window_count" $candidates.Count
     $titles = @()
-    foreach ($h in $candidates) { $titles += [FG]::Title($h) }
+    $classes = @()
+    foreach ($h in $candidates) {
+        $titles += [FG]::Title($h)
+        $classes += [FG]::ClassName($h)
+    }
     Set-Diag "sm_window_titles" $titles
+    Set-Diag "sm_window_classes" $classes
 
     if ($candidates.Count -eq 0) {
         Set-Diag "result" "no_window"
@@ -262,6 +400,9 @@ try {
     $take = Set-ForegroundVerified $candidates $smPid $shell 2500
     Set-Diag "foreground_attempts" $take.attempts
     Set-Diag "foreground_taken" $take.ok
+    Set-Diag "focus_class" $take.focus
+    Set-Diag "target_class" $take.target
+    Set-Diag "focus_hands" $take.hands
 
     if ($action -eq "diagnose") {
         # Dry run of the CF_HTML repair: report what the clipboard's SourceURL
@@ -287,14 +428,56 @@ try {
             smPid = $proc.Id
             windowCount = $candidates.Count
             windows = @($titles | Select-Object -First 6)
+            windowClasses = @($classes | Select-Object -First 6)
             foregroundTaken = $take.ok
             foregroundTitle = $take.title
+            focusClass = $take.focus
+            targetClass = $take.target
             attempts = $take.attempts
             previousRun = $previousRun
             log = $LOG_PATH
         }
         # Leave the desktop as we found it — the user asked for a check, not a
         # focus steal.
+        try { [void][FG]::Force($previousForeground) } catch { }
+        exit 0
+    }
+
+    if ($action -eq "selftest") {
+        # Prove that a keystroke really reaches SuperMemo, without creating
+        # anything: Ctrl+F only SHOWS the Find dialog (a window SuperMemo always
+        # has, hidden), so "did the dialog appear" is a clean yes/no on "did the
+        # app receive the key". Then close it through the window manager.
+        $findBefore = [FG]::FindTopLevelByClass($smPid, "TMyFindDlg")
+        $shownBefore = ($findBefore -ne 0) -and [FG]::IsVisible([IntPtr]$findBefore)
+        Set-Diag "selftest_find_before" $shownBefore
+        $shell.SendKeys("^f")
+        Start-Sleep -Milliseconds 900
+        $findAfter = [FG]::FindTopLevelByClass($smPid, "TMyFindDlg")
+        $shownAfter = ($findAfter -ne 0) -and [FG]::IsVisible([IntPtr]$findAfter)
+        Set-Diag "selftest_find_after" $shownAfter
+        $reacted = ($shownAfter -and -not $shownBefore)
+        if ($reacted) {
+            [FG]::CloseWindow($findAfter)
+            Start-Sleep -Milliseconds 400
+            $stillOpen = [FG]::IsVisible([IntPtr]$findAfter)
+            Set-Diag "selftest_dialog_closed" (-not $stillOpen)
+        }
+        Set-Diag "selftest_reacted" $reacted
+        Set-Diag "result" "selftest"
+        Save-Diag
+        Write-Message @{
+            ok = $true
+            code = "selftest"
+            reacted = $reacted
+            foregroundTaken = $take.ok
+            foregroundTitle = $take.title
+            focusClass = $take.focus
+            targetClass = $take.target
+            attempts = $take.attempts
+            log = $LOG_PATH
+        }
+        # selftest must not leave the desktop somewhere the user did not put it.
         try { [void][FG]::Force($previousForeground) } catch { }
         exit 0
     }
@@ -306,37 +489,49 @@ try {
         Write-Message @{
             ok = $false
             code = "activate_failed"
-            error = "SuperMemo could not take the foreground (currently '" + $take.title + "')"
+            error = ("SuperMemo could not take the keyboard (foreground='" + $take.title +
+                     "', keyboard='" + $take.focus + "')")
             fg = $take.title
+            focusClass = $take.focus
+            targetClass = $take.target
         }
         exit 0
     }
-
-    # Let the focus land inside the app, then re-verify immediately before the
-    # keypress so we never type into whatever grabbed the foreground meanwhile.
-    Start-Sleep -Milliseconds 90
-    if ([FG]::ForegroundPid() -ne $smPid) {
-        [void][FG]::Force($candidates[0])
-        Start-Sleep -Milliseconds 90
-    }
-    $fgTitle = [FG]::ForegroundTitle()
-    Set-Diag "foreground_title" $fgTitle
-    Set-Diag "foreground_pid" ([FG]::ForegroundPid())
-    $windowsBefore = @([FG]::VisibleWindowsOf($smPid)).Count
 
     # 3b) Make the pasted payload look like a manual Ctrl+C: the CF_HTML
     #     SourceURL must be the PAGE, not the extension popup. Chrome writes the
     #     popup's chrome-extension:// URL, which IE cannot use as a base, and an
     #     unusable base is what turns into a res:// link and Windows' "open this
-    #     'res' link?" dialog. SuperMemo is already in the foreground here, so it
-    #     reads the clipboard a moment later — write it now, verify it, and only
-    #     then send the key. A failure here is logged and ignored: pasting the
+    #     'res' link?" dialog. A failure here is logged and ignored: pasting the
     #     note beats refusing to paste it.
+    #     This is done BEFORE the last keyboard check on purpose: the check that
+    #     matters is the one immediately before the keypress, and the clipboard
+    #     repair needs no keyboard at all.
     $fix = Repair-ClipboardSourceUrl $pageUrl $true
     Set-Diag "clipboard_rewrite" $fix.status
     Set-Diag "clipboard_source_before" $fix.source_before
     Set-Diag "clipboard_source_after" $fix.source_after
     if ($fix.detail) { Set-Diag "clipboard_rewrite_detail" $fix.detail }
+
+    # 3c) Last check, as close to the keypress as possible: is the keyboard still
+    #     where SuperMemo can act on it? Chrome grabs it back the moment its
+    #     action popup closes, and re-activating SuperMemo parks the focus in the
+    #     embedded IE host again — hence the same hand-over as before, and the
+    #     sleep afterwards so the focus change can settle before the key.
+    Start-Sleep -Milliseconds 90
+    if (-not (Test-Keyboard $smPid).ok) {
+        [void][FG]::Force($candidates[0])
+        Start-Sleep -Milliseconds 60
+        [void][FG]::FocusVclControl([int64]$candidates[0])
+        Start-Sleep -Milliseconds 60
+    }
+    $fgTitle = [FG]::ForegroundTitle()
+    $focusBeforeKey = Get-SmFocusClass $smPid
+    Set-Diag "foreground_title" $fgTitle
+    Set-Diag "foreground_pid" ([FG]::ForegroundPid())
+    Set-Diag "focus_before_key" $focusBeforeKey
+    Set-Diag "keyboard_ok" ((Test-Keyboard $smPid).ok)
+    $windowsBefore = @([FG]::VisibleWindowsOf($smPid)).Count
 
     # 4) Add a new article, in ONE step. Ctrl+N is SuperMemo's
     #    "Edit : Add a new article" — SuperMemo creates the element and pastes
@@ -357,9 +552,11 @@ try {
     Start-Sleep -Milliseconds 800
     $fgAfter = [FG]::ForegroundTitle()
     $fgAfterPid = [FG]::ForegroundPid()
+    $focusAfter = Get-SmFocusClass $smPid
     $windowsAfter = @([FG]::VisibleWindowsOf($smPid)).Count
     Set-Diag "foreground_after" $fgAfter
     Set-Diag "foreground_after_pid" $fgAfterPid
+    Set-Diag "focus_after_key" $focusAfter
     Set-Diag "sm_windows_before" $windowsBefore
     Set-Diag "sm_windows_after" $windowsAfter
     Set-Diag "result" "sent"
@@ -369,6 +566,9 @@ try {
         ok = $true
         fg = $fgTitle
         fgAfter = $fgAfter
+        focus = $focusBeforeKey
+        focusAfter = $focusAfter
+        target = $take.target
         attempts = $take.attempts
         newWindow = ($windowsAfter -gt $windowsBefore)
         sourceStatus = $fix.status

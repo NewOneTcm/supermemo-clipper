@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "SuperMemo Clipper v2",
-  "version": "2.3.0",
+  "version": "2.3.1",
   "description": "一键清理网页广告与无关格式，保留标题、网址和正文（正文/全页双模式）；自动在 SuperMemo 新建条目并粘贴（Ctrl+N），并把剪贴板来源地址改成网页地址以避免 res:// 对话框。",
   "permissions": ["activeTab", "scripting", "nativeMessaging", "storage"],
   "action": {

@@ -213,16 +213,23 @@ async function boot(opts) {
   {
     // The clipboard guard added in v2.2.1 exists so SuperMemo's own failure
     // ("Error adding new text topic. Cannot open clipboard") never has to be
-    // the first thing the user sees. The activate_failed branch gained teeth in
-    // v2.2.4: it now names the window that actually held the foreground, which
-    // is the difference between "SuperMemo refused" and "Chrome kept it".
+    // the first thing the user sees. v2.3.1 changed what the host reports on
+    // success: not "which window was in front" (SuperMemo's app frame could be
+    // in front with the keystroke still being swallowed) but "which window owned
+    // the keyboard", which is the class the user sees as 键盘：....
     const cases = [
       ["成功", { ok: true }, /已新建条目并粘贴到 SuperMemo/],
-      ["成功（带收件窗口）", { ok: true, fg: "MYBRAIN (SuperMemo 20: d:\\supermemo\\systems\\)" },
-        /收件窗口：MYBRAIN/],
+      ["成功（带键盘所在窗口）", { ok: true, focus: "TBitBtn", target: "TElWind" },
+        /键盘：TBitBtn/],
+      ["成功（没检测到新窗口时给提示）", { ok: true, focus: "TBitBtn", newWindow: false },
+        /未检测到新窗口/],
       ["未运行", { ok: false, code: "not_running" }, /打开后按 Ctrl\+N 即可/],
-      ["无法激活", { ok: false, code: "activate_failed", fg: "ChatGPT - Google Chrome" },
-        /没能把 SuperMemo 切到前台（当前前台是「ChatGPT - Goog/],
+      ["无法激活", { ok: false, code: "activate_failed", fg: "ChatGPT - Google Chrome",
+        focusClass: "Shell DocObject View" },
+        /没能把键盘交给 SuperMemo（前台：「ChatGPT - Goog/],
+      ["无法激活时点名吃掉按键的窗口类",
+        { ok: false, code: "activate_failed", fg: "X", focusClass: "Shell DocObject View" },
+        /键盘：「Shell DocObject View」/],
       ["剪贴板为空", { ok: false, code: "clipboard_empty" }, /剪贴板里没有内容/],
       ["host 未注册", null, /native host 未注册/]
     ];
@@ -261,6 +268,8 @@ async function boot(opts) {
       windows: ["MYBRAIN (SuperMemo 20: d:\\supermemo\\systems\\)"],
       foregroundTaken: true,
       foregroundTitle: "反共识观点：第6辑 处世. 观点1.  反对盲目跟风投资",
+      focusClass: "TBitBtn",
+      targetClass: "TElWind",
       attempts: 1,
       previousRun: {
         ts: "2026-10-11 16:20:01",
@@ -268,6 +277,8 @@ async function boot(opts) {
         foreground_attempts: 3,
         foreground_title: "ChatGPT - Google Chrome",
         foreground_after: "MYBRAIN (SuperMemo 20: d:\\supermemo\\systems\\)",
+        focus_before_key: "TBitBtn",
+        focus_hands: 1,
         sm_windows_before: 8,
         sm_windows_after: 9,
         clipboard_text_len: 3657,
@@ -292,8 +303,15 @@ async function boot(opts) {
     check("显示剪贴板字数与格式", /3657 字 \+ HTML/.test(t) && /HTML Format/.test(t), t);
     check("显示 SuperMemo 进程与窗口数",
       /sm20 \(pid 12724\)/.test(t) && /可见顶层窗口 9 个/.test(t), t);
-    check("显示能不能接管前台", /能否从 Chrome 手里接管前台：可以（第 1 次尝试成功）/.test(t), t);
-    check("回显上次运行的真实收件窗口",
+    check("显示键盘能否交给 SuperMemo",
+      /键盘能否交给 SuperMemo：可以（第 1 次尝试成功）/.test(t), t);
+    check("显示激活的窗口类与拿到键盘的窗口类",
+      /激活的窗口类：TElWind/.test(t) && /拿到键盘的窗口类：TBitBtn/.test(t), t);
+    check("回显上次运行发键时键盘在哪",
+      /发键时键盘在：TBitBtn/.test(t), t);
+    check("回显上次运行把焦点交出去几次",
+      /把焦点交给 SuperMemo 控件：1 次/.test(t), t);
+    check("回显上次运行的真实前台窗口",
       /发键时前台：ChatGPT - Google Chrome/.test(t), t);
     check("回显发键后的前台窗口",
       /发键后前台：MYBRAIN/.test(t), t);
@@ -312,8 +330,8 @@ async function boot(opts) {
       }
     });
     await bad.diagnose();
-    check("抢不到前台时明确指出来",
-      /不可以 ← 这就是粘贴失败的原因/.test(bad.diagText()), bad.diagText());
+    check("抢不到键盘时明确指出来",
+      /不可以 ← 这就是「点了没反应」的原因/.test(bad.diagText()), bad.diagText());
     check("没有上次记录时也说得清楚",
       /还没有记录/.test(bad.diagText()), bad.diagText());
 

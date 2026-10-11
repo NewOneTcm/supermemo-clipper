@@ -34,9 +34,11 @@ v2 与 v1（`supermemo-clipper`）完全独立：独立的扩展目录、独立�
 
 - **自动新建条目**：v1 只发 Ctrl+V（会粘贴进当前元素）；v2 发 Ctrl+N（SuperMemo 的「Add a new article」），由 SuperMemo 自己新建元素并读剪贴板完成粘贴——和手动剪藏网页是同一个动作。
 - **进程级检测**：先查 `sm*.exe` 进程，SuperMemo 没开直接报「未运行」，不再靠窗口标题瞎猜。
-- **激活可靠性**：`SendKeys` 只认「当前前台窗口」，而宿主是被 Chrome 在后台拉起来的——Windows 的前台锁会拒绝它，`SetForegroundWindow` 被降级成**任务栏闪一下**，按键就落到了 Chrome 手里（症状：SuperMemo 闪一下，什么都没粘上）。v2 用 `AttachThreadInput` 接管输入队列真正抢到前台，**抢到之后还要用 `GetForegroundWindow` 验证确实握在手里才发键**，抢不到就明说抢不到、不再假装粘贴成功。
-- **状态可读**：popup 明确区分各种结果——已新建并粘贴（并回显**「收件窗口」**，即发键瞬间前台是谁）/ SuperMemo 未运行（剪贴板已备好）/ 没能切到前台（并报出当前前台是谁）/ 剪贴板为空 / native host 未注册。
-- **一键诊断**：popup 右下角「诊断」按钮，不发按键、不新建条目，直接告诉你剪贴板里有什么、SuperMemo 起了几个窗口、**能不能从 Chrome 手里接管前台**，以及宿主上一次真正执行时记录到的实况。
+- **激活可靠性**：`SendKeys` 只认「当前前台窗口」，而宿主是被 Chrome 在后台拉起来的——Windows 的前台锁会拒绝它，`SetForegroundWindow` 被降级成**任务栏闪一下**，按键就落到了 Chrome 手里（症状：SuperMemo 闪一下，什么都没粘上）。v2 用 `AttachThreadInput` 接管输入队列真正抢到前台，**抢到之后还要验证确实握在手里才发键**，抢不到就明说抢不到、不再假装粘贴成功。
+- **键盘真的交到 SuperMemo 手上了吗**（v2.3.1，这是最隐蔽的一层）：把前台抢过来不等于按键会生效。实测发现——无论用 `SetForegroundWindow`、`BringWindowToTop`、`SwitchToThisWindow`，还是「先激活主框架再激活元素窗口」，SuperMemo **都会把键盘焦点留在元素窗口里内嵌的 IE 宿主上**（`Shell DocObject View` / `Internet Explorer_Server`）；发到那个窗口的按键会被 IE 吃掉，应用层的快捷键派发根本收不到。此时「前台是 SuperMemo」这条检查全部为真、宿主也照样报成功，可 `Ctrl+N` 就是毫无反应。而且 `.NET` 报的 `MainWindowHandle` 是 SuperMemo 的 `TApplication` 框架窗口（标题是集合名），激活它同样等于把按键丢进黑洞。现在宿主会判断**键盘落在哪个窗口类**上，并主动把焦点交给 SuperMemo 自己的一个控件（VCL 类，优先 `Next repetition` 那个按钮——就是人手动操作时焦点所在的位置），验证通过才发键。
+- **状态可读**：popup 明确区分各种结果——已新建并粘贴（并回显**「键盘」在哪个窗口类上**）/ SuperMemo 未运行（剪贴板已备好）/ 没能把键盘交给 SuperMemo（并报出前台是谁、键盘卡在哪个窗口类）/ 剪贴板为空 / native host 未注册。
+- **一键诊断**：popup 右下角「诊断」按钮，不发按键、不新建条目，直接告诉你剪贴板里有什么、SuperMemo 起了几个窗口、**键盘有没有真的交到 SuperMemo 手上（交到了哪个窗口类）**，以及宿主上一次真正执行时记录到的实况。
+- **宿主自检**（`{ "action": "selftest" }`，命令行工具用）：发一次 `Ctrl+F` 而不是 `Ctrl+N`，看 SuperMemo 的「Find elements」对话框有没有弹出来——弹了说明按键真的被应用收到了，然后把它关掉。不发空键、不新建元素，是验证这一层最干净的办法。
 
 ## 工作原理
 
@@ -45,19 +47,19 @@ v2 与 v1（`supermemo-clipper`）完全独立：独立的扩展目录、独立�
    - **全页模式**：跳过 Readability。先判定是否为对话页（是则只取消息块），否则取整个 `<body>`；再删掉脚本样式、导航页头页脚、表单控件、弹窗和 `aria-hidden` 节点。
 2. 对结果做二次清洗：只保留白名单标签（段落、标题、列表、表格、引用、图片、链接等），剥掉所有 style/class/事件属性，并把 `div`/`section` 这类容器拍平成真正的 `<p>`（不会产生非法的 `<p><p>` 嵌套），顺带清掉空容器。**每一条 URL 都必须既安全又是绝对地址**：协议白名单只放行 `http(s)` / `ftp` / `mailto` / 内联 `data:image`，其余（`res:`、`javascript:`、`blob:`、`ms-*` 等）一律清掉（图片整张丢弃，链接只去掉 `href`、保留文字）；剩下的一律用页面地址补成绝对地址，**连 `#锚点` 也补**——笔记里只要有一条相对地址，SuperMemo 就会弹窗（原因见下面「已知边界」）。
 3. 组装成 `<h1>标题</h1> + 来源链接 + <hr> + 正文` 的干净 HTML，同时生成纯文本版本，以 `text/html` + `text/plain` 两种格式写入剪贴板。
-4. 通过 native messaging 调起 `native\paste.ps1`，并把**当前页地址**一起送过去：查进程 -> 校验剪贴板非空 -> **抢 SuperMemo 的前台并验证确实抢到了**（抢不到就如实报错，不假装粘贴）-> **把剪贴板 CF_HTML 的 `SourceURL` 从扩展 popup 地址改写成网页地址**（`native/cfhtml.ps1`，字节级改写 + 回读校验，失败就跳过）-> 发 `Ctrl+N`（SuperMemo 的 `Edit : Add a new article`：新建元素并粘贴剪贴板）-> 记录发键瞬间与发键之后前台窗口是谁、SuperMemo 窗口数有没有变化、来源地址改写前后的值。popup 会顺带回显这次抓了多少（如「12 条消息 · 8432 字 · 图 2 · 链 23」），方便判断是否抓全；若有链接因为 URL 不可用被丢弃，会再带上「丢弃 N 个无效链接」；改写过来源地址会显示「来源地址已修正」；右下角还显示扩展版本号，方便确认 Chrome 到底在跑哪一份代码。
+4. 通过 native messaging 调起 `native\paste.ps1`，并把**当前页地址**一起送过去：查进程 -> 校验剪贴板非空 -> **抢 SuperMemo 的前台，并验证「键盘是否真的落在 SuperMemo 自己的控件上」**（只验证前台是不够的，见上面那条；没落在就主动把焦点交给它的控件，仍然不行就如实报错，不假装粘贴）-> **把剪贴板 CF_HTML 的 `SourceURL` 从扩展 popup 地址改写成网页地址**（`native/cfhtml.ps1`，字节级改写 + 回读校验，失败就跳过）-> 发 `Ctrl+N`（SuperMemo 的 `Edit : Add a new article`：新建元素并粘贴剪贴板）-> 记录发键瞬间/之后的前台窗口、键盘在哪个窗口类上、SuperMemo 窗口数有没有变化、来源地址改写前后的值。popup 会顺带回显这次抓了多少（如「12 条消息 · 8432 字 · 图 2 · 链 23」），方便判断是否抓全；若有链接因为 URL 不可用被丢弃，会再带上「丢弃 N 个无效链接」；改写过来源地址会显示「来源地址已修正」；右下角还显示扩展版本号，方便确认 Chrome 到底在跑哪一份代码。
 
 ## 自动粘贴没生效怎么办
 
-先点 popup 右下角的**「诊断」**（不发按键、不新建条目），它会直接给出三件事：
+先点 popup 右下角的**「诊断」**（不发按键、不新建条目），它会直接给出几件事：
 
 - **剪贴板**：多少字、带不带 `HTML Format` 格式。若字数为 0，说明写剪贴板那一步就没成功。
 - **SuperMemo**：进程名/pid、有几个可见顶层窗口。若显示「没有运行」，那是进程没起来。
 - **剪贴板来源地址（SourceURL）**：现在是什么、粘贴前会被改成什么。这一行指向 `chrome-extension://…/popup/popup.html` 时，就是弹 `res://` 对话框的根因（见「已知边界」）。
-- **能不能从 Chrome 手里接管前台**：显示「不可以」时，这句话就是粘贴失败的原因本身（`SendKeys` 的按键没人接收）。
-- 最后还附上**宿主上一次真正执行时记录的实况**（发键瞬间/之后的前台窗口、窗口数变化、来源地址改写结果、结果），存在 `%TEMP%\supermemo-clipper-last.json`，从 popup 关掉也不影响。
+- **键盘能否交给 SuperMemo**：显示「不可以」时，这句话就是「点了没反应」的原因本身；下面还会写清**前台是谁**、**激活的是哪个窗口类**、**键盘实际卡在哪个窗口类**上。看到键盘卡在 `Shell DocObject View` / `Internet Explorer_Server` / `TApplication` 这几个类上，就是 v2.3.1 修的那个毛病（元素窗口内嵌的 IE 宿主 / 应用框架吃掉了按键）——新版本会自动把焦点改交给 SuperMemo 的控件，正常时这里应该显示 `TBitBtn`、`TEdit` 这类它自己的控件类。
+- 最后还附上**宿主上一次真正执行时记录的实况**（发键瞬间/之后的前台窗口、发键时键盘在哪个窗口类、窗口数变化、来源地址改写结果、结果），存在 `%TEMP%\supermemo-clipper-last.json`，从 popup 关掉也不影响。
 
-如果诊断说「可以接管前台」但你仍然什么都没粘上，把诊断面板的最后一段连同 SuperMemo 的窗口标题一并发出来即可定位。
+如果诊断说「键盘可以交给 SuperMemo」但你仍然什么都没粘上，那就只剩两种可能：SuperMemo 自己的 `Ctrl+N` 在这台机器上被改过，或者剪贴板内容 SuperMemo 不认（诊断里的剪贴板那两行能看出来）。把诊断面板的最后一段连同 SuperMemo 的窗口标题一并发出来即可定位。
 
 **为什么需要这个按钮**：popup 在 SuperMemo 抢到焦点的那一刻就会被 Chrome 自动关掉，所以运行结果根本来不及显示。真正可靠的凭证写在宿主那侧，靠这个按钮取回。
 
@@ -104,9 +106,9 @@ cd supermemo-clipper
 
 ```
 supermemo-clipper-v2/
-  manifest.json            扩展清单 (MV3)，v2.3.0
+  manifest.json            扩展清单 (MV3)，v2.3.1
   background.js            MV3 service worker（占位，逻辑全在 popup）
-  popup/popup.html|.js     模式选择 + 提取 + 复制 + 调 native host（带 pageUrl）+ 状态回显（含来源地址修正、收件窗口、版本号）+ 诊断面板
+  popup/popup.html|.js     模式选择 + 提取 + 复制 + 调 native host（带 pageUrl）+ 状态回显（含来源地址修正、键盘所在窗口类、版本号）+ 诊断面板
   content/common.js        共享清洗与组装（白名单、去脚本样式、去注释、容器拍平、URL 协议白名单 + 全部绝对化、空容器清理、成稿兜底 URL 网）
   content/extract.js       正文模式：Readability 抽取
   content/extract-full.js  全页模式：整个 body 导出
@@ -114,9 +116,9 @@ supermemo-clipper-v2/
   native/                  自动粘贴 host（一次性注册）
     com.supermemo.paster.v2.json   host 清单（install.ps1 会写入扩展 ID）
     host.bat               Chrome 调起的入口
-    paste.ps1              进程检测 -> 剪贴板校验 -> 抢前台并验证 -> 改写剪贴板来源地址 -> Ctrl+N -> 记录实况
+    paste.ps1              进程检测 -> 剪贴板校验 -> 抢前台 + 把键盘交给 SuperMemo 控件并验证 -> 改写剪贴板来源地址 -> Ctrl+N -> 记录实况（含 selftest 自检动作）
     cfhtml.ps1             CF_HTML 字节级手术：把 SourceURL 从扩展 popup 改成网页地址（见下）
-    fghelper.cs            前台接管 + 原始剪贴板读写（P/Invoke，会被预编译缓存，见下）
+    fghelper.cs            前台接管 + 窗口/键盘焦点查询 + 原始剪贴板读写（P/Invoke，会被预编译缓存，见下）
     install.ps1            注册到注册表（Chrome/Edge）
     dump-clipboard.ps1     取证工具：把当前剪贴板里的 CF_HTML 逐项打出来（排查 res:// 用）
   test/                    开发自测（不随扩展发布）
@@ -126,9 +128,11 @@ supermemo-clipper-v2/
     verify-wechat.js       拿保存下来的真实微信页面跑正文模式
     verify-img.js          检查微信图片 tp=webp 是否已剥离
     inspect-live.js        用系统 Chrome 打开线上页面，跑真实内容脚本并报告残留 URL
-    host-probe.js          按真实 native messaging 协议直接跑宿主（默认只诊断，不落按键）
+    host-probe.js          按真实 native messaging 协议直接跑宿主（diagnose / selftest 都不落按键、不建条目）
     url-forensics.js       敌意页面扫描：把几十种 URL 载体喂进真实提取器，逐属性审计输出里有没有非绝对 URL
     cfhtml-roundtrip.ps1   对真实剪贴板做 SourceURL 改写往返测试：断言笔记字节完全不变
+    sm-focus-probe.ps1     只读取证：列出 SuperMemo 所有顶层窗口的类名与 z 序、以及键盘焦点落在哪个窗口
+    sm-key2.ps1            激活策略矩阵：七种抢焦点配方各发一次 Ctrl+F，看哪一种才真能让 SuperMemo 收到按键
   icons/                   扩展图标
 ```
 
@@ -142,17 +146,22 @@ node test\verify-all.js                       # 提取回归，退出码 0 表�
 node test\verify-popup.js                     # popup 交互逻辑（含 native 各返回分支与诊断面板）
 node test\url-forensics.js                    # 敌意页面：逐属性审计输出里有没有非绝对 URL
 node test\host-probe.js                       # 按真实协议跑宿主，默认 diagnose：不发按键、不建条目
-node test\host-probe.js new_and_paste "https://example.com/p" "2.3.0"   # 真发一次 Ctrl+N（会建条目，谨慎）
+node test\host-probe.js selftest "https://example.com/p" "2.3.1"  # 发一次 Ctrl+F，验证按键真能被 SuperMemo 收到
+node test\host-probe.js new_and_paste "https://example.com/p" "2.3.1"   # 真发一次 Ctrl+N（会建条目，谨慎）
 node test\verify-wechat.js saved-page.html    # 用真实页面验证正文模式
 node test\verify-img.js saved-page.html       # 用真实页面验证 tp=webp 已剥离
 node test\inspect-live.js "https://…"         # 线上页面体检（需系统装有 Chrome/Edge）
 powershell -ExecutionPolicy Bypass -File test\cfhtml-roundtrip.ps1   # 对真实剪贴板做 SourceURL 往返测试
 powershell -ExecutionPolicy Bypass -File native\dump-clipboard.ps1  # 看剪贴板里到底有什么（含 SourceURL）
+powershell -ExecutionPolicy Bypass -File test\sm-focus-probe.ps1    # 只看：SuperMemo 各窗口的类名/焦点在哪（不动任何东西）
+powershell -ExecutionPolicy Bypass -File test\sm-key2.ps1           # 七种抢焦点配方各发一次 Ctrl+F，看哪种真能收到按键
 ```
 
 `cfhtml-roundtrip.ps1` 会先把当前剪贴板备份到 `%TEMP%\supermemo-clipper-clipboard-backup.bin`，再改写它的 SourceURL，然后逐字节比对笔记内容；只要笔记有一个字节变了就自动还原并报失败。改 `cfhtml.ps1` 之后跑一遍它，是改动这个「会动用户剪贴板」的代码的唯一保险。
 
-`host-probe.js` 用和 Chrome 完全相同的格式（4 字节小端长度头 + UTF-8 JSON）跟宿主对话，所以能在不开浏览器的情况下验证「进程检测 / 剪贴板预检 / 能否抢前台 / 发键之后世界变成什么样」，是排查自动粘贴问题时最省事的一层。
+`host-probe.js` 用和 Chrome 完全相同的格式（4 字节小端长度头 + UTF-8 JSON）跟宿主对话，所以能在不开浏览器的情况下验证「进程检测 / 剪贴板预检 / 键盘有没有交到 SuperMemo 手上 / 发键之后世界变成什么样」，是排查自动粘贴问题时最省事的一层。`selftest` 用的是 `Ctrl+F`（只会弹出 SuperMemo 本来就有的「Find elements」对话框，看完立刻用 `WM_CLOSE` 关掉），所以它可以在**不新建任何条目**的前提下回答「按键到底有没有被应用收到」——修 v2.3.1 那个 bug 靠的就是它。
+
+`sm-key2.ps1` 是那个 bug 的证据生成器：它把「`SetForegroundWindow` / `BringWindowToTop` / `SwitchToThisWindow` / 先框架后元素窗口 / 再 `SetFocus` 到内嵌 IE / 再 `SetFocus` 到 VCL 控件」这几种配方逐一试一遍，每种都发一次 `Ctrl+F` 看结果。结论：**只有把焦点交给 SuperMemo 自己的控件（VCL 类）才会生效**，其余配方都会把焦点留在内嵌 IE 宿主上，按键被吃掉。
 
 `inspect-live.js` 专治「本地 curl 拿到的 HTML 和插件看到的根本不是一回事」：它用系统 Chrome 打开页面、等前端渲染完，再把 `content/common.js` + `content/extract-full.js` 真正注入进去跑一遍，然后把渲染后的 DOM 和提取结果存到 `test/saved/`，并列出所有残留的 `href`/`src`。排查「笔记在 SuperMemo 里出问题」时，先看它报的 URL 列表里有没有相对地址即可定性。
 
@@ -174,11 +183,17 @@ powershell -ExecutionPolicy Bypass -File native\dump-clipboard.ps1  # 看剪贴�
   2. **笔记里带了相对地址**——v2.2.3 起清洗阶段**不留任何相对地址**，连 `#锚点` 也补成绝对地址。SuperMemo 集合里至今还留着这类痕迹：老笔记里能看到 `<A href="chrome-extension://phjnj…/popup/popup.html#LinkTarget_1038">`——那正是 IE 拿「基址」把相对锚点拼出来的结果。
   3. **基址本身是坏的（v2.3.0 修的，也是最容易被漏掉的一层）**——剪贴板里的 CF_HTML 有一行 `SourceURL:`，它就是 IE 解析这份笔记时的文档基址。Chrome 写入时用的是**执行复制动作的那个文档**的地址，而本扩展是在 popup 里写剪贴板的，于是那行变成了 `chrome-extension://<扩展ID>/popup/popup.html`。IE 拿这个 scheme 当基址根本用不了，就退回自己的 `res://` 基址——**笔记里明明全是 `https://`，照样弹框**。手动 `Ctrl+C` 从来不弹，是因为网页复制的 `SourceURL` 就是网页地址。v2.3.0 起宿主在发 `Ctrl+N` 之前把这一行改写成真实网页地址（`native/cfhtml.ps1` 做字节级改写并回读校验，笔记正文一个字节都不动），自动路径从此和手动路径完全一致；顺带把 SuperMemo 条目的来源引用也修对了（以前那行是扩展的地址）。
 - 弹框时怎么定性（30 秒）：`powershell -ExecutionPolicy Bypass -File native\dump-clipboard.ps1` 会把剪贴板里的 CF_HTML 头部、`SourceURL`、片段里每一个 `href`/`src` 和所有 `scheme://` 打出来。① 片段里出现非绝对 URL → 清洗有漏洞；② 片段全干净但 `SourceURL` 指向 `chrome-extension://…/popup/popup.html` → 就是上面第 3 条（把扩展和宿主都更新到 v2.3.0，并确认 popup 上显示的版本号一致）；③ 两者都干净还弹框 → 触发源不在这份笔记里（Windows 上反复弹这个框，最常见的是某个后台程序或计划任务在调 ShellExecute），可以在 SuperMemo 的 HTML 组件里右键 → View source 或按 F9 搜 `res:` 来确认，再开任务管理器 →「详细信息」→ 右键列标题勾「命令行」看是谁在跑。
-- **扩展和宿主必须成对更新**：v2.3.0 的修正在宿主（`native/cfhtml.ps1`）里，`%TEMP%\supermemo-clipper-last.json` 和「诊断」面板都会报 `clipboard_rewrite` 与改写前后的 `SourceURL`，据此可确认宿主这一层是否真的生效。
+- **扩展和宿主必须成对更新**：v2.3.1 的修正在宿主（`native/paste.ps1` + `native/fghelper.cs`），`%TEMP%\supermemo-clipper-last.json` 和「诊断」面板都会报 `focus_class` / `target_class` / `keyboard_ok`，据此可确认宿主这一层是否真的生效；v2.3.0 的修正也在宿主（`native/cfhtml.ps1`），同样有 `clipboard_rewrite` 可查。
 - v2.2.2 之前剪藏的笔记里可能还留着相对地址或 `res://`（已被 IE 拼成奇怪地址写进笔记），打开时照样弹框——把那条笔记删掉、重新剪藏一次即可。
 
 ## 升级记录
 
+- **v2.3.1**：修「**正文和全页都没反应，只有手动按 Ctrl+N 才有用**」——也就是看着像「又变回老毛病了」的那次。这次不是前台没抢到：宿主明明把 SuperMemo 拉到了前台、`GetForegroundWindow` 也确认前台进程就是它，日志里 `foreground_taken: true`，可 `Ctrl+N` 就是什么都不发生。真正的根因是**键盘焦点落在哪个窗口上**：
+  - `.NET` 报的 `MainWindowHandle` 是 SuperMemo 的 `TApplication` 框架窗口（标题就是集合名），宿主原来把它排在候选列表第一位。激活它确实能让 SuperMemo 到前台，但**键盘焦点也留在那个框架窗口自己身上**，发过去的按键没人派发——所以「前台检查」全绿而粘贴毫无动静。
+  - 换成激活元素窗口（`TElWind`）之后仍然不行，而且更隐蔽：实测发现无论用 `SetForegroundWindow`、`BringWindowToTop`、`SwitchToThisWindow`，还是「先框架再元素窗口」的两步激活，焦点都会落在元素窗口**内嵌 IE 的宿主窗口**上（`Shell DocObject View` / `Internet Explorer_Server`）。SuperMemo 是 Delphi/VCL 程序，菜单快捷键的派发只在焦点位于它自己的控件上时才有效；发到内嵌 IE 的按键被 IE 吃掉。
+  - 决定性证据不是推理出来的，是量出来的：用 `test/sm-key2.ps1` 把七种抢焦点配方各跑一遍，每种都发一次 **`Ctrl+F`**（只会弹出 SuperMemo 本来就有的「Find elements」对话框，看完用 `WM_CLOSE` 关掉，不新建任何条目）——**六种配方 `Ctrl+F` 毫无反应，只有「抢到前台后把焦点显式交给元素窗口里的一个 VCL 控件」那一种成功弹出对话框**。同一套派发路径，也就是 `Ctrl+N` 的路径。
+  - 所以现在宿主做三件事：① 候选窗口改为**元素窗口优先**（按 z 序取最上面那个，即用户最后在用的那个），框架窗口垫底；② 抢到前台后不是只看 pid，而是判断**键盘实际落在哪个窗口类**上，若落在内嵌 IE 宿主或应用框架上，就主动把焦点交给 SuperMemo 自己的一个控件（VCL 类、`WS_TABSTOP`、优先 `Next repetition` 那个按钮——正是人手动操作时焦点所在的位置）；③ 验证三项全过（前台是 SuperMemo、键盘在 SuperMemo 手上、那个窗口是它自己的控件）才发键，任何一项不成立都不发键、如实报错。另外：如果 SuperMemo **本来**就拿着键盘（比如你刚在它里面点过），宿主一律不动任何窗口，不制造多余的焦点变化。
+  - 配套：`native/paste.ps1` 新增 `{ "action": "selftest" }`（发 `Ctrl+F` 验证按键真能被收到，不建条目）；popup 的成功回显从「收件窗口」改成「**键盘**：<窗口类>」，失败回显会点名「键盘卡在哪个窗口类」；诊断面板新增激活窗口类、拿到键盘的窗口类、把焦点交出去几次；新增只读取证工具 `test/sm-focus-probe.ps1`（窗口类名 + z 序 + 焦点在哪）与证据生成器 `test/sm-key2.ps1`。
 - **v2.3.0**：修「笔记内容全干净、粘贴时却仍然弹『获取打开此'res'链接的应用』」。根因不在笔记里，而在**剪贴板的基址**：CF_HTML 的 `SourceURL` 就是 IE 解析这份笔记的文档基址，而 Chrome 写的是「执行复制的那个文档」的地址——本扩展在 popup 里写剪贴板，于是那行成了 `chrome-extension://<扩展ID>/popup/popup.html`。IE 拿这个 scheme 当不了基址，就退回自己的 `res://` 基址，于是任何要被解析的 URL 都可能变成 `res://…`，Windows 接手弹框。手动 `Ctrl+C` 不弹框的原因也在这里：网页复制的 `SourceURL` 就是网页地址。
   现在 popup 把当前页地址随 native 消息一起送出，宿主在发 `Ctrl+N` 之前用 `native/cfhtml.ps1` 对剪贴板做**字节级**改写（只改 `SourceURL`，重算 `StartHTML/EndHTML/StartFragment/EndFragment` 四个字节偏移，写完回读校验：源地址对、笔记字节数不变，才继续发键；任何可疑就跳过并照旧发键，绝不让修复本身弄坏一次粘贴）。附带修好的是 SuperMemo 条目的来源引用——以前存进去的是扩展 popup 的地址。
   同一版还补了另外两处漏洞：**① IE 条件注释**——`<!--[if IE]><img src="/x.png"><![endif]-->` 对 Chrome 是注释（任何 DOM 清洗器都看不见里面），对 IE 却是真标记，藏在里面的相对地址能一路漏到 SuperMemo 弹框，现在所有 HTML 注释一律删除；**② 成稿兜底网**——`build()` 在组装完的 HTML 上再做一次 `href`/`src` 审计，不是绝对+白名单协议就删掉属性，并把条数记进 `meta.urls.scrubbed`（popup 会并进「丢弃」里显示）。同时新增 `test/url-forensics.js`（敌意页面逐属性审计）、`test/cfhtml-roundtrip.ps1`（真实剪贴板往返测试）、`native/dump-clipboard.ps1`（剪贴板取证）三个工具，以及 popup 的「来源地址已修正」回显与诊断面板里的 SourceURL 一节。

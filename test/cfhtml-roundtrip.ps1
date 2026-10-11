@@ -14,6 +14,13 @@
 # first, so nothing can be lost.
 #
 #   powershell -ExecutionPolicy Bypass -File test\cfhtml-roundtrip.ps1
+#
+# A passing run deliberately leaves the rewritten payload on the clipboard (that
+# is the thing being demonstrated) and prints where the original was backed up.
+# To put the original back:
+#
+#   powershell -ExecutionPolicy Bypass -File test\cfhtml-roundtrip.ps1 -Restore
+param([switch]$Restore)
 $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
@@ -40,11 +47,26 @@ if (-not ([System.Management.Automation.PSTypeName]'CLIP').Type) {
 
 function Fail($msg) { Write-Output ("FAIL: " + $msg); exit 1 }
 
+$backup = Join-Path $env:TEMP "supermemo-clipper-clipboard-backup.bin"
+
+if ($Restore) {
+    # Undo a previous passing run: the only thing that run changed was the
+    # SourceURL inside the CF_HTML block (it wrote the same text flavor back), so
+    # putting the saved bytes back restores the clipboard exactly.
+    if (-not (Test-Path $backup)) { Fail ("no backup at " + $backup) }
+    $orig = [System.IO.File]::ReadAllBytes($backup)
+    $text = [CLIP]::ReadText()
+    if (-not [CLIP]::Write("HTML Format", $orig, $text)) { Fail "clipboard write refused" }
+    $hdr = Get-CfHeaderText $orig
+    $src = [regex]::Match($hdr, $CF_RE["SourceURL"])
+    Write-Output ("RESTORED " + $orig.Length + " bytes from " + $backup)
+    Write-Output ("  SourceURL is back to: " + $src.Groups[1].Value.Trim())
+    exit 0
+}
+
 $before = [CLIP]::ReadFormat("HTML Format")
 if (-not $before) { Fail "no CF_HTML on the clipboard - copy something in the browser first" }
 $textBefore = [CLIP]::ReadText()
-
-$backup = Join-Path $env:TEMP "supermemo-clipper-clipboard-backup.bin"
 [System.IO.File]::WriteAllBytes($backup, $before)
 Write-Output ("[0] original CF_HTML: " + $before.Length + " bytes -> backed up to " + $backup)
 

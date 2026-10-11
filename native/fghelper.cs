@@ -25,8 +25,32 @@ public class FG {
     [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
     [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
     [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
+    [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr parent, EnumProc cb, IntPtr l);
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr w, IntPtr l);
+    [DllImport("user32.dll")] public static extern IntPtr SetFocus(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr hWnd, uint flags);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassNameW(IntPtr hWnd, StringBuilder s, int n);
+    [DllImport("user32.dll")] public static extern bool GetGUIThreadInfo(uint tid, ref GUITHREADINFO gti);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowTextW(IntPtr hWnd, StringBuilder s, int n);
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")] static extern IntPtr GetWindowLongPtrW(IntPtr h, int i);
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongW")] static extern IntPtr GetWindowLongW(IntPtr h, int i);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RECT { public int Left, Top, Right, Bottom; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct GUITHREADINFO {
+        public int cbSize;
+        public int flags;
+        public IntPtr hwndActive;
+        public IntPtr hwndFocus;
+        public IntPtr hwndCapture;
+        public IntPtr hwndMenuOwner;
+        public IntPtr hwndMoveSize;
+        public IntPtr hwndCaret;
+        public RECT rcCaret;
+    }
 
     public static string Title(IntPtr h) {
         var sb = new StringBuilder(512);
@@ -85,6 +109,159 @@ public class FG {
             return true;
         }, IntPtr.Zero);
         return res;
+    }
+
+    public static string ClassName(IntPtr h) {
+        var sb = new StringBuilder(256);
+        GetClassNameW(h, sb, 256);
+        return sb.ToString();
+    }
+
+    public static bool IsVisible(IntPtr h) { return IsWindowVisible(h); }
+
+    // All top-level windows of one process, Z-order (topmost first).
+    public static List<long> TopLevelWindowsOf(uint pid) {
+        var res = new List<long>();
+        EnumWindows(delegate(IntPtr h, IntPtr l) {
+            uint p;
+            GetWindowThreadProcessId(h, out p);
+            if (p == pid) res.Add(h.ToInt64());
+            return true;
+        }, IntPtr.Zero);
+        return res;
+    }
+
+    // The top-level window that really owns the keyboard inside a process.
+    //
+    // Means everything here. "SuperMemo is the foreground window" is NOT the
+    // same as "SuperMemo will receive the keystroke": its TApplication frame
+    // window can be the foreground AND hold the focus, in which case a key sent
+    // to it is simply dropped, while every check on the foreground pid still
+    // says "success". The window that dispatches the app's shortcuts is the
+    // element window (TElWind), and when it is active, GetGUIThreadInfo reports
+    // the focus inside it (e.g. one of its buttons).
+    //
+    // Returns the focus window of the process's GUI thread mapped up to its
+    // top-level window, or 0 when the process owns no focus at all (which is
+    // also what a background process reports - Windows only fills these fields
+    // in once the thread is in the foreground).
+    public static long FocusRoot(uint pid) {
+        var threads = new List<uint>();
+        EnumWindows(delegate(IntPtr h, IntPtr l) {
+            uint p;
+            uint t = GetWindowThreadProcessId(h, out p);
+            if (p == pid && !threads.Contains(t)) threads.Add(t);
+            return true;
+        }, IntPtr.Zero);
+        foreach (uint t in threads) {
+            var g = new GUITHREADINFO();
+            g.cbSize = Marshal.SizeOf(typeof(GUITHREADINFO));
+            if (!GetGUIThreadInfo(t, ref g)) continue;
+            IntPtr hwnd = g.hwndFocus != IntPtr.Zero ? g.hwndFocus : g.hwndActive;
+            if (hwnd != IntPtr.Zero) return GetAncestor(hwnd, 2).ToInt64();  // GA_ROOT
+        }
+        return 0;
+    }
+
+    // The focus window itself (not mapped up to its top level). We need the
+    // exact window, because "inside the element window" is not precise enough:
+    // see FocusVclControl.
+    public static long FocusWindow(uint pid) {
+        foreach (uint t in GuiThreads(pid)) {
+            var g = new GUITHREADINFO();
+            g.cbSize = Marshal.SizeOf(typeof(GUITHREADINFO));
+            if (!GetGUIThreadInfo(t, ref g)) continue;
+            if (g.hwndFocus != IntPtr.Zero) return g.hwndFocus.ToInt64();
+            if (g.hwndActive != IntPtr.Zero) return g.hwndActive.ToInt64();
+        }
+        return 0;
+    }
+
+    public static List<uint> GuiThreads(uint pid) {
+        var res = new List<uint>();
+        EnumWindows(delegate(IntPtr h, IntPtr l) {
+            uint p;
+            uint t = GetWindowThreadProcessId(h, out p);
+            if (p == pid && !res.Contains(t)) res.Add(t);
+            return true;
+        }, IntPtr.Zero);
+        return res;
+    }
+
+    public static long StyleOf(IntPtr h) {
+        try {
+            return IntPtr.Size == 8 ? GetWindowLongPtrW(h, -16).ToInt64()
+                                    : GetWindowLongW(h, -16).ToInt64();
+        } catch { return 0; }
+    }
+
+    public static List<long> Descendants(long topLevel) {
+        var res = new List<long>();
+        EnumChildWindows(new IntPtr(topLevel), delegate(IntPtr h, IntPtr l) {
+            res.Add(h.ToInt64());
+            return true;
+        }, IntPtr.Zero);
+        return res;
+    }
+
+    // Focus a real VCL control inside a window.
+    //
+    // This is the difference between a keystroke that works and one that
+    // vanishes. SuperMemo's element window embeds Internet Explorer
+    // ("Shell Embedding" > "Shell DocObject View" > "Internet Explorer_Server"),
+    // and when the TElWind form is activated from a background process the
+    // focus lands on that embedded host - measured, all of SetForegroundWindow,
+    // BringWindowToTop, SwitchToThisWindow and a frame-then-element double
+    // activation end up there. Keys delivered to it are swallowed by IE and
+    // never reach the application's shortcut dispatcher: with the focus on
+    // Shell DocObject View, Ctrl+F does nothing, while focusing a TBitBtn makes
+    // the very same Ctrl+F open SuperMemo's Find dialog.
+    //
+    // So we put the focus where SuperMemo itself would: on one of its own
+    // controls (a class starting with T, WS_TABSTOP, visible). "Next repetition"
+    // is preferred when present because that is where SuperMemo leaves the focus
+    // after a repetition - i.e. exactly the state a human clips from.
+    public static long FocusVclControl(long topLevel) {
+        long best = 0;
+        foreach (long h in Descendants(topLevel)) {
+            IntPtr p = new IntPtr(h);
+            if (!IsWindowVisible(p)) continue;
+            if ((StyleOf(p) & 0x10000) == 0) continue;            // WS_TABSTOP
+            string c = ClassName(p);
+            if (!c.StartsWith("T")) continue;                     // VCL controls only
+            if (c.Contains("ScrollingStyleHook")) continue;        // style hook, not a control
+            string t = Title(p);
+            if (t.IndexOf("Next repetition", StringComparison.Ordinal) >= 0) {
+                if (FocusChild(p)) return h;
+            }
+            if (best == 0 && FocusChild(p)) { best = h; }
+        }
+        return best;
+    }
+
+    // SetFocus on a window of another thread: only possible while our input
+    // queue is attached to that thread's queue.
+    public static bool FocusChild(IntPtr child) {
+        uint p;
+        uint t = GetWindowThreadProcessId(child, out p);
+        uint me = GetCurrentThreadId();
+        bool joined = (t != 0 && t != me) && AttachThreadInput(me, t, true);
+        try { return SetFocus(child) != IntPtr.Zero; }
+        finally { if (joined) AttachThreadInput(me, t, false); }
+    }
+
+    // First top-level window of a process with this window class, or 0.
+    public static long FindTopLevelByClass(uint pid, string cls) {
+        foreach (long h in TopLevelWindowsOf(pid)) {
+            if (ClassName(new IntPtr(h)) == cls) return h;
+        }
+        return 0;
+    }
+
+    // Ask a window to close itself (WM_CLOSE). Used by the self-test to dismiss
+    // the dialog it opened, without touching the keyboard again.
+    public static void CloseWindow(long h) {
+        if (h != 0) PostMessage(new IntPtr(h), 0x0010, IntPtr.Zero, IntPtr.Zero);
     }
 }
 

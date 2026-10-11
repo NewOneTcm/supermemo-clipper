@@ -219,21 +219,28 @@ async function run(mode) {
     const srcNote = resp && resp.sourceStatus === "fixed" ? " · 来源地址已修正" : "";
 
     if (resp && resp.ok) {
-      // "收件窗口" is the window that owned the foreground when the key went
-      // out. If it says SuperMemo, the keystroke landed in SuperMemo; if it
-      // says anything else, the paste went somewhere else — which is the whole
-      // failure mode this field exists to expose.
-      const got = resp.fg ? " · 收件窗口：" + shortTitle(resp.fg, 14) : "";
-      setStatus(head + "已新建条目并粘贴到 SuperMemo" + size + got + srcNote, "ok");
+      // resp.focus is the window class that owned the KEYBOARD when the key went
+      // out — not merely the foreground process. That distinction is the whole
+      // bug fixed in v2.3.1: activating SuperMemo's app frame (or letting the
+      // focus sit in the element window's embedded IE host) satisfied "the
+      // foreground is SuperMemo" while the keystroke was swallowed, so nothing
+      // happened at all. resp.focus should therefore read as a SuperMemo control
+      // class (TBitBtn / TEdit / TVirtualStringTree ...).
+      const kb = resp.focus ? " · 键盘：" + resp.focus : "";
+      // No new element window is not proof of failure (SuperMemo can reuse the
+      // current element window), so this is a nudge, not an error.
+      const noWin = resp.newWindow === false ? "（未检测到新窗口，若没看到新条目请点「诊断」）" : "";
+      setStatus(head + "已新建条目并粘贴到 SuperMemo" + size + kb + srcNote + noWin, "ok");
       setTimeout(() => window.close(), 1400);
     } else if (resp && resp.code === "not_running") {
       setStatus(head + "SuperMemo 未运行，内容已在剪贴板" + size + "，打开后按 Ctrl+N 即可", "warn");
       // Keep the popup open so the hint stays readable.
     } else if (resp && resp.code === "activate_failed") {
-      // The key would have gone to some other program, so don't pretend it was
-      // pasted. Say who was holding the foreground instead.
-      const who = resp.fg ? "（当前前台是「" + shortTitle(resp.fg, 14) + "」）" : "";
-      setStatus(head + "已复制" + size + "，但没能把 SuperMemo 切到前台" + who +
+      // The key would have gone to some other program (or been swallowed), so
+      // don't pretend it was pasted. Say exactly what held the keyboard.
+      const who = resp.fg ? "（前台：「" + shortTitle(resp.fg, 14) + "」" : "（";
+      const kb = resp.focusClass ? "，键盘：「" + resp.focusClass + "」）" : "）";
+      setStatus(head + "已复制" + size + "，但没能把键盘交给 SuperMemo" + who + kb +
         "，请在 SuperMemo 里手动按 Ctrl+N", "warn");
       diagEl.style.display = "block";
       diagEl.textContent = "点右下角「诊断」看详细原因。";
@@ -408,6 +415,20 @@ async function runDiagnose() {
   }
 }
 
+// Window classes that mean "a keystroke sent here will be eaten". SuperMemo
+// renders the note inside an embedded Internet Explorer, and after an automatic
+// activation the keyboard very easily ends up in that host (or on the app frame)
+// instead of on one of SuperMemo's own controls — in which case Ctrl+N does
+// nothing at all. This map is what turns that diagnosis into a sentence.
+const FOCUS_HINT = {
+  "Shell DocObject View": " ← 元素窗口里内嵌的 IE 宿主，按键被它吃掉",
+  "Shell Embedding": " ← 内嵌 IE 的宿主窗口，按键被它吃掉",
+  "Internet Explorer_Server": " ← 内嵌 IE，按键被它吃掉",
+  "TApplication": " ← 应用框架窗口，不派发快捷键",
+  "TSMMain": " ← 应用框架窗口，不派发快捷键",
+  "": " ← 没拿到键盘"
+};
+
 function formatDiagnosis(r) {
   const L = [];
   L.push("==== 本次检查 ====");
@@ -440,10 +461,12 @@ function formatDiagnosis(r) {
 
   L.push("SuperMemo：" + (r.smProcess || "?") + " (pid " + (r.smPid || "?") + ")，" +
     "可见顶层窗口 " + (r.windowCount || 0) + " 个");
-  L.push("能否从 Chrome 手里接管前台：" +
+  L.push("键盘能否交给 SuperMemo：" +
     (r.foregroundTaken ? "可以（第 " + r.attempts + " 次尝试成功）"
-                       : "不可以 ← 这就是粘贴失败的原因"));
-  if (r.foregroundTitle) L.push("  接管后前台：" + shortTitle(r.foregroundTitle, 30));
+                       : "不可以 ← 这就是「点了没反应」的原因"));
+  if (r.foregroundTitle) L.push("  前台窗口：" + shortTitle(r.foregroundTitle, 30));
+  if (r.targetClass) L.push("  激活的窗口类：" + r.targetClass);
+  if (r.focusClass) L.push("  拿到键盘的窗口类：" + r.focusClass + (FOCUS_HINT[r.focusClass] || ""));
 
   const p = r.previousRun;
   L.push("");
@@ -456,6 +479,8 @@ function formatDiagnosis(r) {
     L.push("结果：" + (p.result || "?"));
     if (p.foreground_attempts != null) L.push("抢前台尝试：" + p.foreground_attempts + " 次");
     if (p.foreground_title) L.push("发键时前台：" + shortTitle(p.foreground_title, 30));
+    if (p.focus_before_key) L.push("发键时键盘在：" + p.focus_before_key + (FOCUS_HINT[p.focus_before_key] || ""));
+    if (p.focus_hands) L.push("把焦点交给 SuperMemo 控件：" + p.focus_hands + " 次");
     if (p.foreground_after) L.push("发键后前台：" + shortTitle(p.foreground_after, 30));
     if (p.sm_windows_before != null) {
       L.push("SuperMemo 窗口数：" + p.sm_windows_before + " → " + p.sm_windows_after);
